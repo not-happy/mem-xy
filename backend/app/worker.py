@@ -1,0 +1,133 @@
+"""Async worker entrypoint: `python -m app.worker`.
+
+The handler registry grows as stages land — P2 registers `route` / `write_facts` /
+`apply_decision`; P5 adds `summarize` (plan §5.6).
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+
+from .core import db
+from .core.config import get_settings
+from .core.llm import get_llm_client
+from .queue.jobs import run_worker
+
+log = logging.getLogger(__name__)
+
+
+def _handle_route(job: dict, conn) -> None:
+    """★ **故意不接 `conn`**：`route_session` 自管三段式事务边界（读→LLM→写），
+    LLM 调用在它内部的**事务外**发生（§5.5）。把 LLM 关在 worker 的连接/事务里
+    正是 §5.5 明确禁止的。"""
+    from .pipeline import router
+    from .queue import jobs
+
+    payload = job["payload"]
+    job_id = job.get("id")
+    # ★ 一个会话的路由动辄 8 分钟以上（实测单次 LLM ≈53s，平均 9 个窗口/会话），
+    #   远超 `queue.lease_seconds=300`。租约一过期，别的 worker 就会抢走这条过期任务重跑。
+    #   两层防护：① 每个窗口开头续一次租约（崩了仍然 300s 内可回收，活着就不会被抢）；
+    #   ② pending_items 有 dedup_hash 幂等键 + complete/fail 校验所有权，
+    #      即便真的被抢，重复执行也排不出第二套待办卡（decisions-log #70 的缺口已补）。
+    #   顺手把 {window, windows_total} 写进 jobs.progress——大会话跑几十分钟，
+    #   没这个进度 UI 上完全看不出它在动（migration 0004）。
+    def on_window(idx: int, total: int) -> None:
+        if not job_id:
+            return
+        # ★ 带 started_at 所有权令牌：租约万一还是被回收了，续租不会误续到
+        #   接管者手里那次执行上（详见 jobs.renew_lease）。
+        jobs.renew_lease(job_id, started_at=job.get("started_at"))
+        jobs.set_progress(job_id, {"window": idx, "windows_total": total})
+
+    router.route_session(payload["session_id"], source=payload.get("source", "claude-code"),
+                         limit=payload.get("limit"),
+                         on_window=on_window if job_id else None)
+
+
+def _handle_write_facts(job: dict, conn) -> None:
+    from .pipeline import facts
+
+    facts.write_facts(job["payload"])   # 同样自管连接，理由见 _handle_route
+
+
+def _handle_apply_decision(job: dict, conn) -> None:
+    """批准 → 落库。不调 LLM，但**同样自管事务**：失败标记必须比抛错先落盘。"""
+    from .pipeline import review
+
+    review.apply_decision(job["payload"])
+
+
+def _handle_apply_proposal(job: dict, conn) -> None:
+    """提案采纳/否决的落库。reject 分支要算 embedding（否决记录），所以自管事务、
+    不接 worker 的连接——理由同 _handle_route。"""
+    from .pipeline import proposals
+
+    proposals.apply_proposal(job["payload"])
+
+
+def _handle_summarize(job: dict, conn) -> None:
+    """观察池 → doc_proposals。★ 自管连接，理由同 _handle_route：里面要调 LLM。
+    payload 可空（全量扫一遍候选分区），也可带 org/project/section/force 只处理一个。"""
+    from .pipeline import summarize
+
+    payload = job.get("payload") or {}
+    stats = summarize.run(org_key=payload.get("org_key"),
+                          project_key=payload.get("project_key"),
+                          section_key=payload.get("section_key"),
+                          force=bool(payload.get("force")))
+    log.info("summarize job %s: scanned=%d proposed=%d empty=%d locked=%d skipped=%d",
+             job.get("id"), stats.scanned, stats.proposed, stats.empty,
+             stats.locked, stats.skipped)
+
+
+def _handle_scan(job: dict, conn) -> None:
+    """Stop hook 触发的那一下：扫 transcript → 给有新素材的会话排 `route` job。
+
+    ★ 同样不接 `conn`：`scan_once` 自己按批开事务，而且全程不调 LLM，
+      但一个会话一个事务是刻意的（一个文件坏了不能拖垮整批）。
+    """
+    from .ingest import scan
+
+    payload = job.get("payload") or {}
+    result = scan.scan_and_queue(include_subagents=bool(payload.get("include_subagents")))
+    log.info("scan job %s: %s", job.get("id"), result)
+
+
+HANDLERS: dict = {
+    "route": _handle_route,
+    "write_facts": _handle_write_facts,
+    "apply_decision": _handle_apply_decision,
+    "summarize": _handle_summarize,
+    "apply_proposal": _handle_apply_proposal,
+    "scan": _handle_scan,
+}
+
+_stop = threading.Event()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-5s %(name)s %(message)s",
+    )
+    settings = get_settings()
+    db.init_pool(min_size=1, max_size=4)
+    try:
+        get_llm_client().refresh_endpoints()
+    except Exception:  # noqa: BLE001 — DB may not be migrated yet; workers retry per job
+        log.exception("could not preload llm_endpoints")
+
+    for sig in ("SIGINT", "SIGTERM"):
+        if hasattr(signal, sig):
+            signal.signal(getattr(signal, sig), lambda *_: _stop.set())
+
+    log.info("worker starting; %d handler(s) registered", len(HANDLERS))
+    run_worker(HANDLERS, should_stop=_stop.is_set)
+    db.close_pool()
+
+
+if __name__ == "__main__":
+    main()

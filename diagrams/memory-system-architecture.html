@@ -1,0 +1,196 @@
+<style>
+  .ma { --bg:#0f1115; --panel:#171a21; --line:#2c313c; --txt:#e6e8ec; --dim:#9aa3b2;
+        --read:#4ea1ff; --write:#f0a35e; --store:#6fcf97; --model:#c792ea; --human:#ff7b9c;
+        font-family: ui-sans-serif,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+        background:var(--bg); color:var(--txt); padding:20px; line-height:1.45; }
+  .ma * { box-sizing:border-box; }
+  .ma h1 { font-size:17px; margin:0 0 2px; letter-spacing:.3px; }
+  .ma .sub { color:var(--dim); font-size:12px; margin-bottom:18px; }
+  .ma .layer { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+               padding:12px 14px; margin-bottom:10px; position:relative; }
+  .ma .lt { font-size:11px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase;
+            color:var(--dim); margin-bottom:9px; display:flex; gap:8px; align-items:center; }
+  .ma .lt b { color:var(--txt); font-size:13px; letter-spacing:.2px; text-transform:none; }
+  .ma .tag { font-size:10px; padding:1px 7px; border-radius:20px; border:1px solid var(--line);
+             color:var(--dim); font-weight:500; letter-spacing:.3px; }
+  .ma .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .ma .box { flex:1 1 0; min-width:130px; background:#1e222b; border:1px solid var(--line);
+             border-radius:7px; padding:8px 10px; }
+  .ma .box .n { font-size:12px; font-weight:600; margin-bottom:3px; }
+  .ma .box .d { font-size:11px; color:var(--dim); }
+  .ma code { font-family:ui-monospace,"Cascadia Mono",Consolas,monospace; font-size:11px;
+             background:#252a35; padding:1px 4px; border-radius:3px; color:#cfd6e4; }
+  .ma .arrow { text-align:center; color:var(--dim); font-size:13px; margin:2px 0; letter-spacing:2px; }
+  .ma .split { display:flex; gap:10px; align-items:stretch; }
+  .ma .split > .layer { flex:1; margin-bottom:0; }
+  .ma .read { border-left:3px solid var(--read); }
+  .ma .write { border-left:3px solid var(--write); }
+  .ma .store { border-left:3px solid var(--store); }
+  .ma .model { border-left:3px solid var(--model); }
+  .ma .human { border-left:3px solid var(--human); }
+  .ma .step { display:flex; gap:8px; align-items:flex-start; padding:6px 0;
+              border-bottom:1px dashed #262b35; font-size:11.5px; }
+  .ma .step:last-child { border-bottom:none; }
+  .ma .step .i { flex:0 0 18px; height:18px; border-radius:50%; background:#252a35;
+                 color:var(--dim); font-size:10px; display:flex; align-items:center;
+                 justify-content:center; font-weight:700; margin-top:1px; }
+  .ma .k { color:var(--txt); font-weight:600; }
+  .ma .note { font-size:11px; color:var(--dim); margin-top:8px; padding-top:8px;
+              border-top:1px solid var(--line); }
+  .ma .pill { display:inline-block; font-size:10px; padding:1px 6px; border-radius:4px;
+              margin-left:4px; vertical-align:1px; }
+  .ma .p-llm { background:#3a2f1f; color:#f0c088; }
+  .ma .p-local { background:#2b2440; color:#cbb0f0; }
+  .ma .p-fast { background:#1d3350; color:#8fc4ff; }
+  .ma .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:14px; padding-top:12px;
+                border-top:1px solid var(--line); font-size:11px; color:var(--dim); }
+  .ma .legend span { display:flex; align-items:center; gap:5px; }
+  .ma .sw { width:10px; height:10px; border-radius:2px; display:inline-block; }
+  .ma .tbl { width:100%; border-collapse:collapse; font-size:11px; }
+  .ma .tbl td { padding:4px 6px; border-bottom:1px solid #232833; vertical-align:top; }
+  .ma .tbl td:first-child { color:var(--dim); white-space:nowrap; }
+</style>
+
+<div class="ma">
+  <h1>AI 个人助理记忆系统 — 架构（现行方案）</h1>
+  <div class="sub">在线记忆层 · 一源三派生 · 读路径零 LLM · 写路径全异步 · PostgreSQL 是唯一真相源</div>
+
+  <!-- 接入层 -->
+  <div class="layer">
+    <div class="lt"><b>接入层</b> Claude Code <span class="tag">首期只支持这一个 agent</span></div>
+    <div class="row">
+      <div class="box"><div class="n">SessionStart hook</div>
+        <div class="d">注入 living_doc（confirmed/pinned，按 org+project 裁剪）+ user 级稳定记忆<br>预算 ~2500 tok</div></div>
+      <div class="box"><div class="n">UserPromptSubmit hook</div>
+        <div class="d">按本轮 query 召回 top-K 记忆<br>预算 ~600 tok</div></div>
+      <div class="box"><div class="n">Stop hook</div>
+        <div class="d">会话结束触发摄取</div></div>
+      <div class="box"><div class="n">MCP server</div>
+        <div class="d"><code>memory_recall</code> <code>note</code> <code>correct</code> <code>search</code> <code>pending</code></div></div>
+    </div>
+    <div class="note">韧性：hook 成功时把 payload 落到 <code>~/.memxy/cache/bootstrap-*.md</code>（哑缓存，只读派生物、永不回写）；服务不可达时 cat 它并标注"离线快照可能过期"。</div>
+  </div>
+
+  <div class="arrow">▼ &nbsp;&nbsp; 读（同步，阻塞用户） &nbsp;&nbsp;|&nbsp;&nbsp; 写（异步，不阻塞） &nbsp;&nbsp; ▼</div>
+
+  <!-- HTTP 核心 -->
+  <div class="layer">
+    <div class="lt"><b>HTTP 核心</b> FastAPI <span class="tag">hooks / MCP / Web UI 都是它的薄适配器</span></div>
+    <div class="row">
+      <div class="box"><div class="n">读端点 <span class="pill p-fast">p95 &lt; 400ms</span></div>
+        <div class="d"><code>/bootstrap</code> <code>/recall</code></div></div>
+      <div class="box"><div class="n">写端点 <span class="pill p-fast">毫秒级 INSERT</span></div>
+        <div class="d"><code>/ingest</code>（只落 conversation_log，立即返回）</div></div>
+      <div class="box"><div class="n">管理端点</div>
+        <div class="d"><code>/memories</code> <code>/pending</code> <code>/doc-proposals</code> <code>/observations</code></div></div>
+    </div>
+  </div>
+
+  <!-- 读写双链路 -->
+  <div class="split">
+    <div class="layer write">
+      <div class="lt"><b>写入链路</b> 全异步</div>
+      <div class="step"><div class="i">1</div><div><span class="k">transcript watcher</span> — tail <code>~/.claude/projects/*/*.jsonl</code><br>
+        过滤后入库（实测信噪比 ~14%）：丢 tool_result / tool_use；留 user text、assistant text、<span class="k">thinking 块</span>（两级筛）、compaction summary</div></div>
+      <div class="step"><div class="i">2</div><div><span class="k">归属判定</span> — 纯规则、零 LLM<br>
+        <code>workspace_map</code> 缓存 → <code>org_match_rules</code> 按 priority：<code>git_remote_path</code>(10) &gt; <code>cwd_prefix</code>(50/80)<br>
+        未命中 → 默认 <code>personal</code> + <code>resolved_by='default'</code>，<span class="k">不阻塞</span>，UI 待确认后可批量回溯</div></div>
+      <div class="step"><div class="i">3</div><div><span class="k">extract</span> — 窗口制（user + assistant text + thinking）<span class="pill p-llm">LLM</span><br>
+        <code>extraction_cursor</code> 水位线增量，prompt 升级可对历史重跑</div></div>
+      <div class="step"><div class="i">4</div><div><span class="k">route</span> — 路由器分流 <span class="pill p-llm">LLM</span> <span class="pill p-local">thinking ON</span><br>
+        <span class="k">主判据 = 看用途不看口气</span>：这条是不是<b>每次开工都要无条件提醒 AI</b>？
+        是 → 规范线索；否 → 原子事实。<br>
+        <span class="k">栏位不让模型选</span>：<code>section_key</code> 由 <code>content</code> 向量匹配
+        <code>doc_sections.label + aliases</code> 取 top-1（实测模型自选会三次跑飘）<br>
+        <span class="k">门控</span>：<b>规范线索不设门控，100% 进人工待办</b>；原子事实 0.85 / 丢弃 0.95<br>
+        摇摆或栏位匹配不出 → <code>pending_items</code>，<b>且预选「规范线索」</b>（偏向规矩侧）<br>
+        <span class="k">落库前两次向量比对</span>：① vs <code>living_doc</code> 同 section → 相似即 NOOP；
+        ② vs <code>raw_observations(polarity='negative')</code> → 相似即 <code>discard(rejected_before)</code>。
+        <b>只查库，不读任何外部规则文件</b></div></div>
+      <div class="note"><span class="k">为什么规矩类要全审、不看 confidence</span>：3+3 实测里 <b>15 条判错的样本 confidence 全在 0.93–1.0</b>（关掉 thinking 时 15 条全报 1.0），0.95 的阈值一条也拦不住。而两种误判代价不对称——误判成「规范线索」只是进线索池，后面还有汇总 + 人审 diff 两道能拦；误判成「原子事实」= 一条本该每次注入的规矩被静默存成零碎事实，<b>永远不会被提议、不会注入，且没有任何环节能发现</b>。量扛得住：72 个会话只有 24 条规矩信号，按 73% 准确率算约 6–7 条会判错，全审是唯一捞回手段。</div>
+      <div class="note"><span class="k">为什么 route 开 thinking</span>：同素材各跑 3 次，<b>召回两边都是 15/15</b>，但分类准确率 <b>开 73% vs 关 47%</b>。代价是延迟 24.6s vs 5.1s、token 932 vs 337 —— 写入链路全异步（PG job 队列 + lease），延迟落在后台用户无感；分类错则规矩静默丢失，不可逆。<b>读路径完全不调 LLM</b>，400ms 预算不受影响。</div>
+      <div class="step"><div class="i">5</div><div><span class="k">write_facts</span> — 四动作批量 <span class="pill p-llm">LLM</span> <span class="pill p-local">reranker</span><br>
+        ADD / UPDATE / DELETE / NOOP；NOOP 累加 <code>mention_count</code></div></div>
+      <div class="step"><div class="i">6</div><div><span class="k">summarize</span> — 比例触发（未 consumed / 现有内容量 ≥ 阈值）<span class="pill p-llm">LLM</span><br>
+        新 section 3 条、成熟 section 20 条 + UI 手动<br>
+        → <code>living_doc(draft)</code> → <code>doc_proposals</code>（人审 diff）→ accepted 升 <code>confirmed/pinned</code>；
+        <b>否决 → 写 negative observation</b>（比对② 的记忆来源）</div></div>
+      <div class="note"><span class="k">队列</span>：<code>jobs</code> 表 + <code>FOR UPDATE SKIP LOCKED</code> + lease 租约，指数退避重试 5 次。不引 Redis / Celery。</div>
+    </div>
+
+    <div class="layer read">
+      <div class="lt"><b>读取链路</b> 零 LLM 调用</div>
+      <div class="step"><div class="i">1</div><div><span class="k">query 编码</span> <span class="pill p-local">bge-m3 本地 CPU</span><br>→ dense 1024 维 + sparse 词权重</div></div>
+      <div class="step"><div class="i">2</div><div><span class="k">可见性过滤</span>（检索分区，非权限）<br>
+        <code>scope='user'</code> 全局穿透 · <code>scope='org'</code> 限本 org · <code>scope='project'</code> 限 <code>org_key</code>+<code>project_key</code></div></div>
+      <div class="step"><div class="i">3</div><div><span class="k">三通道并行召回</span>（各 top-50）<br>
+        ① dense <code>vector(1024)</code> + HNSW → 语义/同义改写<br>
+        ② <code>keywords TEXT[]</code> + GIN → 精确标识符（<code>bookingFlowService</code>）<br>
+        ③ <code>sparsevec(250002)</code> → 字面重叠，<span class="k">免中文分词器</span>（P6/P7 回填）</div></div>
+      <div class="step"><div class="i">4</div><div><span class="k">RRF 融合</span> <code>Σ 1/(60 + rank)</code></div></div>
+      <div class="step"><div class="i">5</div><div><span class="k">加权重排</span><br>
+        scope 权重(project 1.0 / org 0.85 / user 0.7)<br>
+        × 时间衰减（半衰期，<code>last_seen_at</code>）<br>
+        × 提及度 <code>LEAST(1.6, 1+0.15·ln(1+mention_count))</code> <span class="k">封顶</span></div></div>
+      <div class="step"><div class="i">6</div><div><span class="k">组装</span> — 带 <code>memory_id</code> 便于引用与纠错；写 <code>recall_log</code></div></div>
+      <div class="note"><span class="k">必须处理</span>：HNSW 是后过滤，索引取 <code>ef_search</code> 个候选再过滤且不回填 ⇒ <code>LIMIT 5</code> 可能只返回 0–2 行。解法 = partial index <code>WHERE status='active'</code> + <code>SET LOCAL hnsw.iterative_scan = relaxed_ordering</code>（需 pgvector ≥ 0.8.0）。<br>
+      <span class="k">reranker 不进读路径</span>：无 GPU，30 候选要 1–3s，爆掉 400ms 预算。</div>
+    </div>
+  </div>
+
+  <div class="arrow">▼</div>
+
+  <!-- 存储层 -->
+  <div class="layer store">
+    <div class="lt"><b>存储层</b> PostgreSQL + pgvector <span class="tag">唯一真相源 · 不发布成文件</span></div>
+    <div class="row">
+      <div class="box"><div class="n">层 0 · 真相源</div>
+        <div class="d"><code>conversation_log</code><br>不可变、只增不改<br><code>UNIQUE(source, src_uuid)</code></div></div>
+      <div class="box"><div class="n">层 1 · 派生事实</div>
+        <div class="d"><code>memories</code>（原子事实）<br><code>raw_observations</code>（规范线索池）<br>可由层 0 重跑重建</div></div>
+      <div class="box"><div class="n">层 2 · 活文档</div>
+        <div class="d"><code>living_doc</code>（draft/confirmed/pinned）<br><code>living_doc_history</code><br><span class="k">终点就在库里</span></div></div>
+      <div class="box"><div class="n">控制与元数据</div>
+        <div class="d"><code>orgs</code> <code>doc_sections</code> <code>llm_endpoints</code><br><code>workspace_map</code> <code>org_match_rules</code><br><code>jobs</code> <code>extraction_cursor</code></div></div>
+      <div class="box"><div class="n">人在环状态</div>
+        <div class="d"><code>pending_items</code> <code>doc_proposals</code><br><code>route_decisions</code>（标注资产）<br><code>memory_feedback</code></div></div>
+      <div class="box"><div class="n">评测</div>
+        <div class="d"><code>recall_log</code> <code>eval_recall_cases</code><br><code>eval_runs</code> <code>replay_runs</code><br><code>memory_events</code></div></div>
+    </div>
+    <div class="note"><span class="k">分类正交化</span>：<code>scope</code>(user/org/project) × <code>subject</code>(user/project) × <code>role</code>(profile/preference/pointer/fact)。
+      &nbsp;<span class="k">三个中断点全部落表可恢复</span>：extraction_cursor（抽取水位线）/ pending_items（待裁决）/ doc_proposals（待审 diff）。
+      &nbsp;<span class="k">硬幂等</span>：<code>UNIQUE(source_msg, content_hash)</code>，崩溃重放不产生重复记忆。</div>
+  </div>
+
+  <!-- 模型 + 端点 + UI -->
+  <div class="split">
+    <div class="layer model">
+      <div class="lt"><b>模型层</b></div>
+      <table class="tbl">
+        <tr><td>embedding</td><td>bge-m3 本地 CPU <span class="pill p-local">不走网络</span><br>dense 1024 + sparse  lexical weights</td></tr>
+        <tr><td>reranker</td><td>bge-reranker-v2-m3 <span class="pill p-local">仅写路径</span><br>无 GPU，读路径跑不动</td></tr>
+        <tr><td>LLM</td><td><code>dida-gateway</code> <span class="pill p-llm">唯一外流点</span><br>Anthropic 协议兼容 → Qwen3.8-max<br><code>endpoint_for(task)</code> 按任务选，首批全任务共用</td></tr>
+        <tr><td>结构化输出</td><td>双层：tool use 优先 → 回退围栏 JSON + Pydantic 校验 + 2 次重试<br><span class="k">解析失败不丢弃</span>，落 <code>pending_items</code></td></tr>
+      </table>
+    </div>
+
+    <div class="layer human">
+      <div class="lt"><b>人在环</b> Web UI（React + Vite）<span class="tag">AI 起草 + 人纠偏</span></div>
+      <table class="tbl">
+        <tr><td>高优先</td><td>待办中心 · 待确认（pending） · 待审 diff · 归属管理 · <span class="k">召回调试</span> · <span class="k">活文档</span> · <span class="k">观察池</span></td></tr>
+        <tr><td>P5 同期</td><td><span class="k">活文档编辑页</span> — 库是唯一真相源，没有"改文件"这条退路，必须与 hook 注入同期交付</td></tr>
+        <tr><td>否决项</td><td><span class="k">观察池</span>需分开展示 negative 记录并可查看/撤销 —— 它是冷启动噪声期收敛的<b>唯一</b>手段</td></tr>
+        <tr><td>后补</td><td>记忆库 · 词表 · 指标 · shadow 重跑 · 组织管理 · 设置</td></tr>
+        <tr><td>闭环</td><td>裁决结果作为 few-shot 反哺路由 prompt ⇒ 挂起率随时间下降</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i class="sw" style="background:var(--read)"></i>读路径 · 同步 · 零 LLM · p95 &lt; 400ms</span>
+    <span><i class="sw" style="background:var(--write)"></i>写路径 · 异步 · jobs 队列</span>
+    <span><i class="sw" style="background:var(--store)"></i>存储 · PG 单一真相源</span>
+    <span><i class="sw" style="background:var(--model)"></i>模型 · 本地 embedding/reranker + 网关 LLM</span>
+    <span><i class="sw" style="background:var(--human)"></i>人在环 · 裁决与纠错</span>
+  </div>
+</div>

@@ -1,0 +1,21 @@
+# P0 verified set (2026-10-22). torch/sentence_transformers/transformers/fastapi/numpy
+# were already present on this machine — see plan §13 P0.
+fastapi>=0.115
+uvicorn>=0.30
+psycopg[binary]>=3.2
+psycopg_pool>=3.2
+pgvector>=0.3
+alembic>=1.14
+httpx>=0.27
+pydantic>=2.7
+sentence_transformers>=2.7   # ★ 2.7.0 cannot produce bge-m3 sparse weights (plan §2.4 ⑤)
+torch>=2.0                   # CPU build
+pytest>=8.0
+
+# `integrations/mcp-server/mem_mcp.py`（§7.2）跑在**另一个进程**里，但和 backend 共用一个
+# 环境：它的冒烟测试在 `backend/tests/`，要 import mcp 客户端。它自己只需要 mcp + httpx
+# （httpx 上面已经有了；anyio 是 mcp 的传递依赖，`fail_after` 用得到）。
+mcp>=1.28
+
+# Deliberately NOT installed: FlagEmbedding — would unlock the sparse channel but drags
+# torch/transformers versions; revisit at P7 with an eval set (plan §2.4 ⑤).
