@@ -218,7 +218,16 @@ class LLMClient:
                 redact(f"HTTP {response.status_code} from {endpoint.endpoint_key}: "
                        f"{response.text[:2000]}")
             )
-        return response.json()
+        try:
+            return response.json()
+        except ValueError as exc:
+            # ★ 200 但 body 空/非 JSON：dida 网关偶发空响应（探测实证的形态之一，
+            #   2026-11-10 §14 item2）。必须转成 LLMError——JSONDecodeError 冒出去
+            #   既不被 job 队列当可重试，也躲过 _record_usage（监控盲点，
+            #   llm_usage 里"从没见过"这个形态不等于它没发生过）。
+            raise LLMError(
+                f"HTTP 200 from {endpoint.endpoint_key} but non-JSON body "
+                f"({len(response.content)} bytes) — 网关空响应，可重试") from exc
 
     def call_anthropic(self, endpoint, task, system, messages, tools, tool_choice,
                        max_tokens, thinking) -> LLMResponse:

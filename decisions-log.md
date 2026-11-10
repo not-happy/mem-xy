@@ -1531,3 +1531,40 @@ meta、ADD 动作显示「（新建，无原文）— → 提议」+ 逐条/批�
       本会话稍早写的"评测管道落地、清单待人工确认"）。按只增不改纪律不回改
       历史；评测最终状态以前一条 #104（含基线）为准，后一条的"待确认"已过时。
     - 未做：1.3 网关三项探测、1.4 规矩漏判率抽样（Phase 1 剩余两项）。
+
+106. ★ **1.3 网关三项探测完成：上下文 ≥124k 可用、并发无硬限流（并行 2 是甜点）、长 prompt 延迟平缓；顺带修复 llm.py"200 空响应"监控盲点（2026-11-10）。**
+    - 探测①上下文上限（新 bench/bench_gateway_limits.py）：配置
+      max_input_tokens=32000 是 seed.py 自认的占位值，调用路径无人消费、
+      无本地拦截，生产 route 实际送出过 42338 tok 且成功。实测 46758 tok →
+      2.6s、93488 → 3.1s、124643 → 4.2s 全部 200 通过，未探到上限。业务
+      最大单次调用 42k 已有 3 倍余量，停止加档（不再烧 token 探 256k）。
+      max_input_tokens 回填 120000（生产库 UPDATE + seed.py 同步，注释注明
+      换端点/换模型后用探测脚本重测回填）。
+    - 探测②并发/限流（bench_gateway_concurrency.py 已有脚本直跑）：三轮共
+      14 次调用零 429 零失败——网关无硬限流。并行度：1 档 0.6s、2 档 0.6s
+      （真并行）、3 档首测 2.4s、4 档首测 4.1s 而复测 0.7s（完全并行）。
+      结论：**无固定并行度上限，偶发延迟放大是瞬时排队**；worker=2 是
+      甜点区，Phase 3 回填可开至 4 worker（需容忍偶发 ~7x 延迟尖峰；
+      job 队列对 ReadTimeout 的重试已覆盖该形态）。排期按并行 2 保守估。
+    - 探测③长 prompt 延迟曲线：由①的数据得 prefill 约 34ms/k tok
+      （125k → 4.2s），平缓近线性。对照 route 历史 avg 61s / max 166s——
+      **延迟大头在 thinking 与生成，不在输入长度**。窗口切分的 token_budget
+      不必为延迟压缩输入。
+    - 附带发现 A：**网关有 prompt cache**——64k 档 usage.input_tokens 只报
+      15870，cache_read_input_tokens 命中了重复填充文本的前缀。route/extract
+      的固定 system prompt 天然享此折扣，无需改代码；探测脚本统计口径改为
+      input+cache_read+cache_creation 三项之和（否则上限判定会算错）。
+    - 附带发现 B（真实缺陷，已修）：llm.py `_post` 对"HTTP 200 但 body 空/
+      非 JSON"会让 response.json() 抛 JSONDecodeError 冒出去——不是 LLMError
+      （job 队列不当可重试），也绕过 _record_usage。历史 llm_usage 失败形态
+      里确实从无此形态（只有 ReadTimeout/10053/10054/断连/HTTP 500）——
+      **监控里看不见不等于没发生过**（记忆 #2461 的空响应形态之一）。修复：
+      _post 捕获 ValueError 转 LLMError（"网关空响应，可重试"），新增 2 个
+      MockTransport 测试（空 body / 垃圾 HTML body）。断连形态
+      （RemoteProtocolError）本就走 httpx.HTTPError → LLMError，已覆盖。
+    - 探测纪律：直接 httpx 不走 LLMClient、不写 llm_usage（不污染生产监控
+      均值，与评测 runner write_log=False 同一理由）；thinking disabled +
+      max_tokens=32 控成本。总消耗 ~281k input tok（其中 ~155k 为 cache
+      命中，实际计费更低）/ output 9 tok。
+    - 测试：全量 522 passed（520 + 2 新增）。
+    - 未做：1.4 规矩漏判率抽样 30 条（Phase 1 最后一项）。

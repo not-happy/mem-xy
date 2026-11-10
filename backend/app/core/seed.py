@@ -17,9 +17,11 @@ ORGS = [
 ]
 
 ENDPOINTS = [
-    # max_input_tokens is a conservative placeholder: the real ceiling is untested (§14)
+    # max_input_tokens: 实测 124643 tok 通过、未探到上限（bench/bench_gateway_limits.py，
+    # 2026-11-10，#106），取整 120000。调用路径不消费该值（仅展示），换端点/换模型
+    # 后用探测脚本重测回填。
     ("dida-gateway", "http://dragon-open-api.didainternal.com",
-     "qwen3.8-max-anthropic", "anthropic", 32000,
+     "qwen3.8-max-anthropic", "anthropic", 120000,
      "公司内网网关，Anthropic 协议兼容，后端 Qwen。token 不在此表（§2.1）"),
 ]
 

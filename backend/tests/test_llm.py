@@ -166,6 +166,28 @@ def test_transport_error_is_redacted():
         client.complete("route", messages=[{"role": "user", "content": "x"}])
 
 
+def test_http_200_with_empty_body_is_retryable_llm_error():
+    """★ 网关偶发"200 空响应"（§14 item2 探测背景）：必须转 LLMError——
+    可被 job 队列当可重试，且走 complete() 的失败分支记进 llm_usage；
+    裸 JSONDecodeError 冒出去则两边都漏（监控里看不见 ≠ 没发生过）。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"")
+
+    client = make_client(handler)
+    with pytest.raises(LLMError, match="non-JSON body"):
+        client.complete("route", messages=[{"role": "user", "content": "x"}])
+
+
+def test_http_200_with_garbage_body_is_retryable_llm_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html>gateway hiccup</html>",
+                              headers={"content-type": "text/html"})
+
+    client = make_client(handler)
+    with pytest.raises(LLMError, match="non-JSON body"):
+        client.complete("route", messages=[{"role": "user", "content": "x"}])
+
+
 def test_a_missing_token_fails_locally_instead_of_sending_a_bare_request():
     """★ 实测踩过的坑：token 没配时请求照发，dida 网关回的是
     `403 Incorrect SceneId provided.`——看着像网关权限问题，其实是本地没配。
