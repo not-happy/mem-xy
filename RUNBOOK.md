@@ -33,10 +33,11 @@
 ## 1. 日常检查（通常不需要动手）
 
 ```powershell
-.\service.ps1 status      # backend / frontend / worker 状态 + 模型就绪
+.\service.ps1 status      # backend（含 UI 托管与构建新鲜度）/ worker 状态 + 模型就绪
 .\backup.ps1 status       # 最近备份、磁盘占用、GitHub 同步状态
 ```
 
+- **UI 地址：http://127.0.0.1:8787/**（backend 托管 `frontend/dist` 构建产物，无独立前端进程）。改了前端代码：`cd frontend && npm run build`，然后 `.\service.ps1 restart backend` 生效；开发调试可用 `.\service.ps1 start frontend`（5273 热更新）。
 - 今日备份是否落地：`~/.memxy/backups/` 里应有 `memxy-<今天日期>-*.7z.001`（约 7MB/卷）。
 - 日志：`backend.log` / `worker.log`（20MB 滚动）；`watchdog.log` 只在守护有动作时追加。
 - 判断调度是否在跑：`backend.log` 启动时有一行「每日备份调度已启动（触发 ≥ 12:30 …）」。
@@ -66,7 +67,7 @@
 ### 4.1 恢复生产库（数据损坏 / 误删）
 
 ```powershell
-.\service.ps1 stop                                  # ① 停 backend + frontend（worker 一并停）
+.\service.ps1 stop                                  # ① 停全部服务（backend 含 UI；worker/dev frontend 一并停）
 .\backup.ps1 restore -DbName memxy -Force           # ② 最新备份覆盖生产库
 .\service.ps1 start                                 # ③ 起服务，等模型就绪
 python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8787/healthz',timeout=5).status)"   # ④ 应为 200
@@ -93,7 +94,7 @@ python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:
 
 ## 5. 换机迁移 / 灾难恢复（从零开始的新机器）
 
-前提：拿到 **① 项目代码**（本目录不是 git 仓库，需自行拷贝或从代码托管处取）和
+前提：拿到 **① 项目代码**（私有仓 `git clone https://github.com/not-happy/mem-xy.git`）和
 **② 任一加密备份卷 + 加密密码**。备份卷来源：旧机 `~/.memxy/backups/`，或
 `git clone -b backup git@github.com:not-happy/memxy-backup.git`（私有仓，需账号权限）。
 
@@ -117,8 +118,8 @@ psql -U postgres -c "CREATE DATABASE memxy"
 
 # ⑥ 装运行依赖并启动
 pip install -r backend\requirements.txt
-cd frontend && npm install && cd ..
-.\service.ps1 start            # 等 healthz 200（bge-m3 冷启动 15~33s）
+cd frontend && npm install && npm run build && cd ..   # dist 是 UI 本体，必须构建
+.\service.ps1 start            # 等 healthz 200（bge-m3 冷启动 15~33s）；UI = http://127.0.0.1:8787/
 .\service.ps1 install-watchdog # 重新注册守护任务
 
 # ⑦ 重绑 GitHub 离机副本并验证全链路
@@ -142,16 +143,19 @@ cd frontend && npm install && cd ..
 | 12:30 过了 backend.log 没动静 | 正常：今天已有备份时调度幂等跳过且不打日志。确认 `~/.memxy/backups/` 有今日分卷即可 |
 | watchdog 弹窗闪现 | 不应发生（已改 wscript+VBS 静默，#102）。若复现：`schtasks /Query /TN memxy-watchdog /XML` 确认 Action 是 `wscript.exe //B ...vbs`，不是则 `.\service.ps1 install-watchdog` 重注册 |
 | worker 停了（UI 无报错、批准积压） | watchdog 每 5 分钟会自动补齐；等不及就 `.\service.ps1 start worker` |
+| 改了前端但界面没变化 | UI 是构建产物（backend 托管 `frontend/dist`）：`cd frontend && npm run build` 后 `.\service.ps1 restart backend`。`status` 与 start 提示里的「dist 已过期」就是在说这件事；浏览器强刷（Ctrl+F5）排除缓存 |
 | PowerShell 5.1 下脚本报 NativeCommandError / Get-FileHash 找不到 | 历史 bug 已修（#99/#101：Invoke-NativeMuted + .NET SHA256 直算）。若在新环境复现，用 pwsh 7 跑并回报 |
 | 恢复演练对账某表 `★异常` | 该备份不可信，**不要**用它恢复生产；改用更早的分卷（`backups/` 里按日期取）重跑 verify |
 
 ## 7. 命令速查
 
 ```powershell
-# 服务
-.\service.ps1 start | stop | restart | status        # backend + frontend
+# 服务（★ 日常 UI 由 backend 托管，start/stop/restart 默认只管 backend）
+.\service.ps1 start | stop | restart | status        # backend（UI: http://127.0.0.1:8787/）
+.\service.ps1 start frontend | stop frontend         # Vite 开发服务器（仅改前端代码时用）
 .\service.ps1 start worker | stop worker             # 异步抽取 worker
 .\service.ps1 log [backend|frontend|worker]          # 实时日志
+cd frontend; npm run build                           # 前端改动后重新构建，restart backend 生效
 
 # 备份
 .\backup.ps1 backup | verify | status

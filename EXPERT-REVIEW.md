@@ -158,7 +158,7 @@
 ### 5.2 架构收敛：机器即单点 → 让单点可替换、部件尽量少
 
 1. **迁移 runbook（替代多机同步的正确方案）**：一份文档 + 一个脚本，目标是新 Windows 机器 **30 分钟内恢复服务**：装 PG+pgvector → restore pg_dump → 恢复 ~/.memxy → pip install → 模型预热（HF_ENDPOINT=hf-mirror.com）→ npm ci && build → service.ps1 start → /healthz 200 + /recall 冒烟。每季度随恢复演练跑一遍，保证 runbook 不腐烂。
-2. **进程收敛**：frontend 目前是常驻 `npm run dev`（Vite）。单机个人使用建议改为 **构建静态产物由 FastAPI mount 托管**，少一个常驻 Node 进程 = 少一类静默故障 + 释放内存。开发时仍可切回 dev server。
+2. **进程收敛**：~~frontend 目前是常驻 `npm run dev`（Vite）。单机个人使用建议改为 **构建静态产物由 FastAPI mount 托管**，少一个常驻 Node 进程 = 少一类静默故障 + 释放内存。开发时仍可切回 dev server。~~ **已完成（2026-11-10，#105）**：backend mount frontend/dist，UI 与 API 同源 http://127.0.0.1:8787/；dev frontend 仅改前端代码时手动启停；service.ps1 带 dist 新鲜度检查。
 3. **守护用 Windows 原生方案**：计划任务每 5 分钟探 /healthz + workers_ctl.ensure，不引入 NSSM/容器——单机 Windows 下这是运维成本最低的守护。
 4. **网络面确认**：backend 只绑 127.0.0.1（确认 serve 未监听 0.0.0.0），localhost-only 即天然免鉴权免 TLS；这也让 #45"暂不做安全权限"的决策在单机边界内继续成立。
 5. **磁盘治理升格**：单机磁盘是有限且唯一的资源——日志轮转（worker-N.log 目前追加无上限，是最可能静默吃满盘的部件）和保留期清理（6 张原文表）从"卫生问题"升格为"单机可用性前提"。
@@ -212,7 +212,7 @@
 
 - 第一轮落地 = **Phase 0.1（备份）** 的代码部分；0.1 的"恢复演练"要等 `verify` 真机跑通才算闭环。
 - ~~Phase 0 其余项均未动~~ **第二轮（同日）已全部落地**：0.2 router 事务重构、0.3 摄取丢数据、0.4 幂等缺口（pending_items dedup_hash + lease 所有权令牌）、0.5 worker 守护 + 日志轮转、0.6 embedding 双检锁、1.5 run_worker sleep 语义——详见 7.5。
-- §5.2 的进程收敛（FastAPI 托管前端静态产物）、迁移 runbook 文档化：**未动**；backup.ps1 帮助文本里已有一行版迁移步骤可作起点。
+- ~~§5.2 的进程收敛（FastAPI 托管前端静态产物）、迁移 runbook 文档化：**未动**~~ **两项均已完成**：RUNBOOK.md（2026-11-10，备份/恢复/换机/故障排查全路径）；进程收敛（#105，backend 托管 frontend/dist，项目同时首次建 git 仓库推送 not-happy/mem-xy）。§5.2 其余项现状：3（watchdog 计划任务）、4（默认绑 127.0.0.1）已落地；5 的日志轮转已做（20MB 滚动）、**原文表保留期清理未做**；6（plan 显式记录单机约束）**未做**。
 - ~~Phase 1 未动~~ **第四轮同日开工 Phase 1：1.1（评测集 96 条）+ 1.2（runner + 基线 hit@5=0.904 / MRR@10=0.686）已落地**，见 7.10；1.3（网关探测）、1.4（规矩漏判率抽样）未做。
 
 ### 7.5 第二轮实施记录（2026-11-09，Phase 0 收尾 + 全量验证）

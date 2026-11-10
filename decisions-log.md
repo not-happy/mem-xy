@@ -1490,3 +1490,44 @@ meta、ADD 动作显示「（新建，无原文）— → 提议」+ 逐条/批�
     - 未做项：① 候选清单待用户人工确认（刻意等待，非阻塞遗忘）；② 确认后
       --import + --run 出第一条基线并落 eval_runs（Phase 1.2 的收尾）；
       ③ 1.3 网关探测、1.4 漏判率抽样未动；④ §5.2 进程收敛未动（等用户表态）。
+
+105. ★ **进程收敛：backend 托管前端构建产物，常驻 dev frontend 退役；项目首次建 git 仓库并推送（2026-11-10）。**
+    - 决策：EXPERT-REVIEW §5.2 第 2 条落地。FastAPI 直接 mount frontend/dist
+      （StaticFiles html=True），UI 与 API 同源 http://127.0.0.1:8787/。少一个
+      常驻 Node 进程 = 少一类静默故障 + 释放内存；dev frontend（npm run dev，
+      5273）只保留"改前端代码时"一个用途（热更新、代理 /v1 到 8787）。
+    - 前提（全部实测确认）：前端 API 全走同源相对路径（api.js fetch(path)，
+      vite.config.js 注释明言"生产环境前后端同源"）；tab 路由用 location.hash
+      （手写 useHashTab，无 react-router）——hash 不上服务器，所以无需 SPA
+      fallback。mount 放在全部 router 注册之后：Starlette 按注册顺序匹配，
+      /v1、/healthz 先命中，静态文件兜底，未知 /v1 路径得 404 而非 index.html。
+    - 降级：dist 缺失时 mount_frontend 返回 False + WARNING 日志，API 照常。
+      抽成带 dist 参数的函数便于单测（临时目录造假 dist，不依赖真实构建）。
+    - service.ps1 语义调整：start/stop/restart（all）只管 backend；start
+      frontend 明确标注仅开发模式；新增 Get-DistFreshness（missing/stale/ok，
+      stale = src 有比 dist/index.html 新的改动）+ Write-UiHint（backend 起来
+      后提示 UI 地址或提醒 npm run build）。status 显示 UI 托管新鲜度；dev
+      frontend 停着是常态，显示改灰色不再红色报警。watchdog.ps1 本就不碰
+      frontend，无需改动。
+    - 顺手修的 bug：Metrics.jsx 两处重复 className 属性（Stat/MiniStat，上一轮
+      RecallEvalCard 重写时引入）——JSX 重复属性后者覆盖前者，tone 动态样式
+      实际丢失，vite 构建告警暴露。合并为单个 className。
+    - 验证：新增 tests/test_frontend_mount.py 6 个（假 dist 挂载、API 路由不被
+      mount 吞、静态资源与 404、dist 缺失优雅降级、半成品 dist 视同未构建、
+      真实 dist 端到端）；全量 520 passed。真机 restart backend 后：GET / →
+      200 index.html、/healthz → 200、/v1/metrics → 200、/assets/*.js → 200、
+      /v1/no-such-endpoint → 404。常驻进程收敛为 backend + 2 worker。
+    - git 建仓：项目此前非 git 仓库。git init -b main；仓库级身份 许勇
+      <363728681@qq.com>（全局配置是公司邮箱，个人项目必须仓库级覆盖）；
+      .gitignore 排除运行时产物（*.log、.service-pids、watchdog-silent.vbs、
+      frontend/node_modules、frontend/dist、各类缓存）。初始提交 180 文件
+      （37c047b，无 AI 署名）。推送路径：机器无 gh CLI、SSH known_hosts 无
+      github.com，但离机备份一直走 HTTPS + Windows 凭据管理器（credential
+      helper=manager）——用同一凭据调 GitHub API 创建私有仓 not-happy/mem-xy
+      （HTTP 201），push -u origin main 成功。与 memxy-backup 数据仓分离
+      （代码归代码、加密数据归数据）。
+    - ★ 编号冲突备案：decisions-log 出现两条 #104（并行会话所写"Phase 1.1+1.2
+      落地：96 条已导入、基线 hit@5=0.904 / MRR@10=0.686 已落 eval_runs"，与
+      本会话稍早写的"评测管道落地、清单待人工确认"）。按只增不改纪律不回改
+      历史；评测最终状态以前一条 #104（含基线）为准，后一条的"待确认"已过时。
+    - 未做：1.3 网关三项探测、1.4 规矩漏判率抽样（Phase 1 剩余两项）。
