@@ -1568,3 +1568,30 @@ meta、ADD 动作显示「（新建，无原文）— → 提议」+ 逐条/批�
       命中，实际计费更低）/ output 9 tok。
     - 测试：全量 522 passed（520 + 2 新增）。
     - 未做：1.4 规矩漏判率抽样 30 条（Phase 1 最后一项）。
+
+107. ★ **1.4 规矩漏判率抽样落地：rulemiss 命令 + 34 条全量清单已生成，漏判率待人工判定（2026-11-11）。**
+    - 工具：app/commands/rulemiss.py（--gen 生成清单 / --score 计分）。候选池
+      与 Metrics 页 RuleMissCard 同一口径（复用 metrics._NORMATIVE_WORDS：
+      必须/禁止/不要/一律/每次/不允许/应该），JOIN conversation_log 带出
+      session 溯源帮人工回忆上下文。清单为行协议 markdown
+      （rule-miss-sample.md，项目根），每条改「判定: 待定」行即可。
+    - 判定值四档：规矩（净漏判）/ 已成文（living_doc 已覆盖，曾漏判已补救）/
+      零碎（非漏判）/ 剔除（错误记忆，不计分母）。漏判率两个口径：
+      净 = 规矩/(总数-剔除)；宽 = (规矩+已成文)/(总数-剔除)。
+    - 样本量决策：plan §10 设计抽 30 条，当前候选池仅 34 条——**全量列出**
+      （池接近样本量时全查比抽样省事且无抽样误差）。以后池涨大了再改随机抽。
+    - 数据结构澄清（本轮确认）：memories 表只存自动入库记忆（role=fact/
+      preference/pointer/profile），scope 是可见性维度（user/org/project）；
+      规矩类走 pending_items 人审、批准后进 living_doc，不落 memories。
+      所以"含规范性措辞却出现在 memories"即静默漏判的操作性定义。
+    - 防御性设计：--gen 拒绝覆盖已存在清单（保护人工判定结果，--force 才
+      覆盖）；content 内出现「判定:」字样不会被解析正则误抓（锚定行首）。
+    - 踩坑：str.format 模板里写了 f-string 表达式 {'/'.join(...)} → KeyError；
+      JOIN conversation_log 后裸 content 列歧义（两表都有）→ 必须 m. 前缀；
+      commands/ 下 parents[2] 不是项目根（比 evaluation.py 深一层，是
+      parents[3]）；conversation_log 时间列是 msg_ts/ingested_at 无 created_at。
+    - 测试：tests/test_rulemiss.py 12 个（解析/计分口径/渲染往返/覆盖保护/
+      无溯源标记）。全量 534 passed。
+    - 待办：用户逐条判定 34 条 → --score 出漏判率 → 结果记入本日志并决定
+      是否触发 route prompt 加 few-shot 修正（EXPERT-REVIEW §10 的预设动作：
+      漏判率高 → 修 prompt 提准确率，不是加阈值）。
