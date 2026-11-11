@@ -1,6 +1,6 @@
 """1.4 抽样清单影子重放：拿新 route prompt 把可溯源记忆的**真实源窗口**重判一遍。
 
-用法（backend 目录下）：
+用法（项目根目录下）：
     python bench/replay_route_sample.py --dry    # 只看窗口分组与期望，不调 LLM
     python bench/replay_route_sample.py          # 影子重放 + 改判对照
 
@@ -30,7 +30,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.commands.rulemiss import DEFAULT_SAMPLE_FILE, parse_verdicts  # noqa: E402
 from app.core import db  # noqa: E402
