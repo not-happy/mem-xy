@@ -244,15 +244,17 @@ def test_a_prompt_version_bump_reprocesses_the_whole_session(db, session, matche
         router.route_session(SESSION, conn=conn, llm=FakeLLM(discard, {"items": []}))
     assert len(decisions(db)) == 1
 
-    monkeypatch.setattr(route_prompt, "PROMPT_VER", "route-v2")
+    old_ver = route_prompt.PROMPT_VER
+    new_ver = old_ver + "-test"
+    monkeypatch.setattr(route_prompt, "PROMPT_VER", new_ver)
     llm = FakeLLM(discard, {"items": []})
     with db.transaction() as conn:
         router.route_session(SESSION, conn=conn, llm=llm)
     assert llm.call_count == 2          # 游标被重置了，两个窗口都重判
     rows = decisions(db)
-    assert {r["prompt_ver"] for r in rows} == {"route-v1", "route-v2"}
+    assert {r["prompt_ver"] for r in rows} == {old_ver, new_ver}
     assert db.query_one("SELECT prompt_ver FROM extraction_cursor WHERE session_id=%s",
-                        (SESSION,))["prompt_ver"] == "route-v2"
+                        (SESSION,))["prompt_ver"] == new_ver
 
 
 def test_a_parse_failure_lands_in_pending_and_never_drops_the_material(db, session, matched):
@@ -344,12 +346,14 @@ def test_a_prompt_version_bump_issues_a_fresh_review_card(db, session, matched, 
     router.route_session(SESSION, llm=FakeLLM(payload, {"items": []}))
     assert len(pending(db)) == 1
 
-    monkeypatch.setattr(route_prompt, "PROMPT_VER", "route-v2")
+    old_ver = route_prompt.PROMPT_VER
+    new_ver = old_ver + "-test"
+    monkeypatch.setattr(route_prompt, "PROMPT_VER", new_ver)
     # 不用手动退游标：_prepare 检测到 prompt_ver 变化会自动从头重判
     router.route_session(SESSION, llm=FakeLLM(payload, {"items": []}))
     rows = pending(db)
     assert len(rows) == 2
-    assert {r["prompt_ver"] for r in rows} == {"route-v1", "route-v2"}
+    assert {r["prompt_ver"] for r in rows} == {old_ver, new_ver}
 
 
 def test_queue_all_sessions_is_idempotent_per_session(monkeypatch):
