@@ -30,6 +30,22 @@ def test_discover_ignores_other_extensions(tmp_path):
     assert len(discover(tmp_path)) == 1
 
 
+def test_discover_marks_forked_copies(tmp_path):
+    """★ decisions-log #110：fork 影子副本首行带 forkedFrom、uuid 全部被重写，
+    `UNIQUE(source, src_uuid)` 幂等挡不住它，必须由 discover 标记出来给 scan 排除。
+    首行读不出来（空文件/坏 JSON）按"不是 fork"处理——宁可入库重复，不可漏扫真会话。"""
+    _write(tmp_path / "p" / "sess-1.jsonl", [{"type": "user"}])
+    _write(tmp_path / "p" / "sess-2.jsonl",
+           [{"type": "attachment", "forkedFrom": {"sessionId": "sess-1", "messageUuid": "u1"}},
+            {"type": "user"}])
+    (tmp_path / "p" / "empty.jsonl").write_text("", encoding="utf-8")
+
+    found = {t.path.replace("\\", "/").rsplit("/", 1)[-1]: t for t in discover(tmp_path)}
+    assert found["sess-1.jsonl"].is_fork is False
+    assert found["sess-2.jsonl"].is_fork is True
+    assert found["empty.jsonl"].is_fork is False
+
+
 def test_discover_on_an_empty_root(tmp_path):
     assert discover(tmp_path) == []
 

@@ -1673,3 +1673,49 @@ meta、ADD 动作显示「（新建，无原文）— → 提议」+ 逐条/批�
       同素材出新 pending 卡——这正是把 #108 那 13 条漏判陆续捞回人审的通道。
     - 测试：test_router.py 两个硬编码 route-v1/v2 的换版测试改为版本无关写法
       （old_ver+"-test"）；全量 534 passed。
+
+110. ★ **Phase 2.1/2.2 收官：接入定案保持全装、回填口径正式定案；transcript 覆盖缺口闭合——发现 fork 影子副本绕过幂等键，discover/scan 默认排除（2026-11-11）。**
+    - 2.1 现状核查与定案：三个 hook（SessionStart bootstrap / UserPromptSubmit
+      recall / Stop flush → integrations/hooks/mem-hook.py）+ MCP mem-xy 在评审
+      时点已装好且持续在工作（本会话每轮有注入与 flush 实证）。Roadmap 建议的
+      "先只装 bootstrap、跑一周再决定 recall"被实际安装进度**越过**——recall
+      的 +290ms/轮成本已经付出。定案：**保持现有配置不缩减**，观察起点从最初
+      安装时起算（不重新计时）；日后若 recall 延迟实测碍事，删 settings.json
+      单条即可。本次只读核查了 Claude Code 配置，未做任何修改（用户规矩：
+      别让系统去读/改其它工具的配置——读取核查属 2.1 验收必需，改动才需授权）。
+    - 2.2 定案：§14 item3 方案 C 正式采纳——实际自 #90（2026-10-27）已在生效
+      （thresholds.atomic_fact=0.0 全自动入库；observation 无阈值 100% 人审，
+      #51 底线不动）；§10 的抽样前提已由 1.4 兑现（#108 净漏判率 38.2% →
+      #109 route-v2 修正）；51 个已入库会话全部持有 extraction_cursor，增量
+      回填随 Stop hook 闭环持续进行、无一次性大回填残留。当前待审积压
+      route 41 + section 41 张 pending 卡，留给用户人审——**AI 不代审**
+      （observation 100% 人审是设计底线，代判抽样是 1.4 的一次性授权，不延伸）。
+    - 覆盖缺口闭合：~/.claude/projects 102 个 jsonl vs 51 个已入库会话，未入库
+      58 个的构成全部查明 = 54 个子代理（agent-*，§3.1 设计排除）+ 3 个启动
+      即弃的空会话（12–16 行、几乎无实质对话，随流水线自然入库、route 预期
+      空跑）+ 1 个 fork 影子副本（下述新发现）。
+    - ★ fork 影子副本发现与修复：92250661 是 harness 今天 14:05 从本会话
+      5813b12c fork 出的快照副本（首行 attachment 带 forkedFrom）。实测三个
+      数字定性：① 文件内 2590 个 uuid 与库中 src_uuid **零重叠**——fork 会
+      重写全部 uuid，`UNIQUE(source, src_uuid)` 幂等键对它完全失效；② 过滤后
+      465 行中 458 行（98%）与库中 (role, content) 完全相同；③ 独有 7 行只是
+      父会话尚未扫到的最后几条消息，父会话下次扫描自然覆盖。若入库，router
+      会把它当全新会话整量重抽，为同素材排出成批重复 pending 卡、直接污染
+      100% 人审队列。
+    - 修复：transcripts.discover() 读文件首行标记 is_fork（首行解析失败按
+      "不是 fork"处理——宁可入库重复不可漏扫真会话）；scan_once 新增
+      include_forks=False 默认排除（对称于 include_subagents）。测试 +2：
+      discover 标记（含空文件容错）、scan 默认排除/显式纳入。全量 536 passed。
+    - ★ 时序紧迫性与 worker 重启：修复必须在队列里那个 pending scan job
+      （4177，13:56 提交）被旧代码 worker 消费之前生效，否则影子会话照样入库
+      再人工清理。已重启 worker（26240/24172 → 12940/17472），新代码接管；
+      被打断的 2 个 route job 由租约回收重排，无损坏（route 三段式事务边界，
+      §5.5）。backend 进程仍是旧代码，但 scan/fork 排除只走 worker 路径，
+      无需为此重启 backend。
+    - 已知缺口（如实记录，暂不修）：① fork 分叉后**自行新增**的对话不会再
+      入库——实测案例里 fork 只是快照副本、无独立增量，可接受；若 fork 并行
+      会话成为常态工作流，需实现"只入库 fork 点之后的行"（难点：uuid 已被
+      重写，只能靠 parentUuid 链或内容对照定位分叉点）。② scan 与 route 排
+      同一 FIFO 队列按 id 序认领：今天 16 个 route job（单个 ≈6min、2 worker）
+      把 scan 压后 1 小时以上（4177 自 13:56 等待）——摄取延迟无 SLA 但值得
+      留意，候选方案是 scan 优先道或独立 worker，等实测到痛再修。

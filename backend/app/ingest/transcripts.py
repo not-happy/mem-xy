@@ -5,6 +5,12 @@
 
 ★ P1 只扫主会话：子 agent 的 `user` 行长度 p50 = 1191 字符，全是父 agent 写的任务书，
 当成人类意图会污染素材（§3.1）。它们的 thinking 是否值得纳入，等有评测集再说（§13 P7）。
+
+★ fork 影子副本也不扫（decisions-log #110）：Claude Code fork/rewind 会话时生成的新文件
+首行带 `forkedFrom`，且**全部 uuid 被重写**——实测 92250661（fork 自 5813b12c）2590 个
+uuid 与库中 src_uuid 零重叠，`UNIQUE(source, src_uuid)` 幂等挡不住；而内容与父会话 98%
+相同，入库会让 router 当新素材重抽一遍、排出成批重复待审卡。副本的少量独有内容多半是
+父会话还没扫到的最后几条消息，父会话下次扫描自然覆盖。
 """
 
 from __future__ import annotations
@@ -30,6 +36,19 @@ class Transcript:
     path: str
     is_subagent: bool
     project_dir: str  # ~/.claude/projects 下的第一层目录名（转义过的 cwd）
+    is_fork: bool = False  # 首行带 forkedFrom 的影子副本，见模块 docstring
+
+
+def _is_forked(path: str) -> bool:
+    """首行是否带 `forkedFrom` 键。fork 元数据在文件创建时写入，只看首行即可；
+    空文件/首行坏 JSON 一律按"不是 fork"处理（宁可入库重复，不可静默漏扫真会话）。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+        record = json.loads(first)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(record, dict) and "forkedFrom" in record
 
 
 def discover(root: Path | str = DEFAULT_ROOT) -> list[Transcript]:
@@ -38,11 +57,13 @@ def discover(root: Path | str = DEFAULT_ROOT) -> list[Transcript]:
     for path in sorted(glob.glob(str(root / "**" / "*.jsonl"), recursive=True)):
         rel = os.path.relpath(path, root).replace(os.sep, "/")
         parts = rel.split("/")
+        is_subagent = "subagents" in parts[:-1]
         out.append(
             Transcript(
                 path=path,
-                is_subagent="subagents" in parts[:-1],
+                is_subagent=is_subagent,
                 project_dir=parts[0] if len(parts) > 1 else "",
+                is_fork=not is_subagent and _is_forked(path),
             )
         )
     return out

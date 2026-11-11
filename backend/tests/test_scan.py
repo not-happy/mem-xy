@@ -15,6 +15,7 @@ from app.ingest.transcripts import SOURCE
 pytestmark = requires_db
 
 SESSION = "pytest-scan-0001"
+FORK_SESSION = "pytest-scan-fork"
 MARKER = "memxy-scan-test"
 
 
@@ -35,7 +36,7 @@ def _assistant(uuid, *blocks, **kw):
 
 @pytest.fixture
 def tree(tmp_path):
-    """一个主会话 + 一个子 agent，目录名带 MARKER 以便清理。"""
+    """一个主会话 + 一个子 agent + 一个 fork 影子副本，目录名带 MARKER 以便清理。"""
     root = tmp_path / MARKER / "projects"
     main = root / "C--x-own-mem-xy"
     main.mkdir(parents=True)
@@ -61,6 +62,15 @@ def tree(tmp_path):
     (sub / "agent-a.jsonl").write_text(
         json.dumps(_user("s1", "只做只读调研，不修改任何文件", cwd=cwd), ensure_ascii=False) + "\n",
         encoding="utf-8")
+
+    # fork 影子副本：首行带 forkedFrom，uuid 全新、内容与父会话重复（#110）
+    fork_rows = [
+        {"type": "attachment", "uuid": "f0", "sessionId": FORK_SESSION, "cwd": cwd,
+         "forkedFrom": {"sessionId": SESSION, "messageUuid": "u2"}},
+        _user("f1", "不要用 Lombok", cwd=cwd, sessionId=FORK_SESSION),
+    ]
+    (main / f"{FORK_SESSION}.jsonl").write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in fork_rows), encoding="utf-8")
     return root
 
 
@@ -129,12 +139,29 @@ def test_dry_run_writes_nothing_and_does_not_poison_the_cache(db, tree):
 
 
 def test_rows_which_lack_a_uuid_are_skipped_and_counted(db, tree):
-    path = next(tree.glob("*/*.jsonl"))
+    path = tree / "C--x-own-mem-xy" / f"{SESSION}.jsonl"
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(_user("", "没有 uuid", cwd="C:/x"), ensure_ascii=False) + "\n")
     stats = scan_once(tree)
     assert stats.no_key == 1
     assert stats.inserted == 5
+
+
+def test_forked_copies_are_excluded_but_can_be_included(db, tree):
+    """★ decisions-log #110：fork 重写全部 uuid，幂等键挡不住；内容与父会话 98% 重复，
+    直接入库会让 router 排出成批重复待审卡。默认排除，显式 include_forks 才收。"""
+    stats = scan_once(tree)
+    assert stats.files == 1                       # fork 与子 agent 都不算
+    assert stats.sessions == {SESSION}
+    assert db.query_one("SELECT count(*)::int AS n FROM conversation_log"
+                        " WHERE session_id=%s", (FORK_SESSION,))["n"] == 0
+
+    stats = scan_once(tree, include_forks=True)
+    assert stats.files == 2
+    # fork 的 attachment 首行被过滤掉，只有 user 行进库——内容与父会话重复但 uuid 不同，
+    # 这正是默认必须排除的原因：幂等键在这里拦不住任何东西
+    assert db.query_one("SELECT count(*)::int AS n FROM conversation_log"
+                        " WHERE session_id=%s", (FORK_SESSION,))["n"] == 1
 
 
 def test_subagents_can_be_included_but_are_excluded_by_default(db, tree):

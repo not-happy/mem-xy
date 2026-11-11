@@ -95,10 +95,15 @@ def scan_once(
     root: Path | str = DEFAULT_ROOT,
     *,
     include_subagents: bool = False,
+    include_forks: bool = False,
     write: bool = True,
     unchanged: dict[str, tuple[int, float]] | None = None,
 ) -> ScanStats:
     """扫一遍并落库。`unchanged` 是调用方持有的 (size, mtime) 缓存，跨次调用复用以跳过没动的文件。
+
+    `include_forks` 默认 False：fork 影子副本的 uuid 全部被重写、内容与父会话高度重复，
+    入库会绕过 `UNIQUE(source, src_uuid)` 幂等、给 router 排出成批重复待审卡
+    （decisions-log #110，详见 transcripts 模块 docstring）。
 
     `write=False` 是空跑：过滤和归属照做，但不写 `conversation_log`，
     用来在动数据库之前把留存数字和 bench 基线（§13 P1）对一遍。
@@ -112,6 +117,8 @@ def scan_once(
 
     for item in discover(root):
         if item.is_subagent and not include_subagents:
+            continue
+        if item.is_fork and not include_forks:
             continue
         try:
             st = os.stat(item.path)
