@@ -1719,3 +1719,195 @@ meta、ADD 动作显示「（新建，无原文）— → 提议」+ 逐条/批�
       同一 FIFO 队列按 id 序认领：今天 16 个 route job（单个 ≈6min、2 worker）
       把 scan 压后 1 小时以上（4177 自 13:56 等待）——摄取延迟无 SLA 但值得
       留意，候选方案是 scan 优先道或独立 worker，等实测到痛再修。
+
+111. ★ **MCP 接入可观测：任务队列页新增 MCP 探视卡片（/v1/mcp*），明确"服务端不启停、只探视/清孤儿/自检"（2026-11-16）。**
+    - 起因：用户问"当前项目存在 mcp 服务吗？是否启动？页面能否显示状态+启停按钮？能否总是跟随 mem-xy 正确启动？"——实测回答：存在且已在使用（mem_mcp.py 由 claude.exe 按会话拉起，PID 38652、父进程 30364），但这一切在页面上**看不见**。
+    - ★ 架构定案（与 #82/#83 一脉）：stdio MCP 是 AI 客户端托管的子进程——客户端不连，起了也只挂在 stdin 上空转、cwd 归属还是错的；杀活进程只会让该会话的工具当场报错。所以**不做启动/停止按钮**（不做常驻服务），页面提供三件替代品：
+      1) 状态探视：`GET /v1/mcp/status`（backend/app/mcp_ctl.py）= 进程扫描（PowerShell CIM 按脚本路径+项目目录名匹配，报 PID/父进程/孤儿/启动时间）+ 可跑性（脚本存在、mcp 包版本、~/.claude.json 与项目 .mcp.json 的注册情况——只回布尔**绝不回传配置内容**）+ 近 7 天 `recall_log WHERE source='mcp'` 活动。verdict：running / orphaned / ready / unregistered / broken。任何底层失败（CIM/DB/注册文件）都降级为字段缺失，探视端点不 500。
+      2) 孤儿清理：`POST /v1/mcp/stop`（默认 orphans_only=true，只杀父进程已退出的残留；杀完清 10s 进程扫描缓存）。
+      3) 真·连接自检：`POST /v1/mcp/selftest`——起一个真 stdio 客户端（mcp SDK，与 test_mcp_server.py 同款）走 initialize→list_tools，对比五个工具名，量耗时；独立线程跑 asyncio（25s 上限，超时报疑似挂起）。
+      "总是跟随 mem-xy 正确启动"的答案是：只要 ~/.claude.json（或项目 .mcp.json）里注册还在、脚本和 mcp 包在位，**客户端每个会话自动拉起**，无需跟随谁——页面的「连接自检」按钮随时可验证这条链路；「复制接入配置」按钮给出当前机器的注册 JSON。
+    - 前端：任务队列页 WorkerControl 旁新增 McpControl 卡片（15s 轮询，进程扫描重故比 worker 的 10s 放宽），api.js +getMcpStatus/stopMcp/mcpSelftest；service.ps1 status 末尾加一行 MCP 状态（后端在时取 /v1/mcp/status，否则本地粗扫进程）。
+    - 测试：tests/test_mcp_ctl.py 13 个纯逻辑+HTTP 形状用例（假 CIM 行、临时注册文件、失败降级、verdict 五态、stop 只杀孤儿、端点形状）。全量回归见当天记录。
+
+112. ★ **第二轮逐行评审定稿（EXPERT-REVIEW-2026-11-26.md）+ ROADMAP.md 定为后续工作指引（2026-11-26）。**
+    - 起因：用户要求以行业顶级专家视角对系统做第二轮架构评审并给出建议与 roadmap。
+      方式：主审逐行读码（recall/read/bootstrap/router/facts/jobs/worker/llm/route
+      prompt/mem-hook 全量或关键段）+ 两路独立专项审查（读路径 ab344944 / 写入链路
+      166900a2）交叉验证，全部结论落到行号。
+    - 主要新发现（证据与修法详见评审文件）：写链路三条静默失效路径——窗口锚点漂移
+      致游标卡死永久漏路由（W1，windows.py:80-82 + router.py:278）、_apply_all 不校验
+      LLM 返回的 memory_id 可被幻觉穿透跨分区软删（W2，facts.py:276-349）、write_facts
+      无续租 lease 过期并发双跑（W3，worker.py:50-53）；读链路无相关性门槛 top-1 恒
+      1.0 必注 5 条（R1，recall.py:259-293）、衰减只认写入不认使用活跃记忆沉底（R2）、
+      生产 hook 不传 prev_assistant_summary 使查询增广为死代码且 128 token 截断令其
+      长查询下失效（S1，mem-hook.py:213-221 + recall.py:8-9）、压缩后 injected 状态
+      不清空已注入记忆永不回归（S2，mem-hook.py:241-251）；另 S3–S9 与中/轻微项共
+      40+ 条全部落行号。总体定性：产品闭环自 11-09 评审由 D 升 B；主要矛盾转为
+      "静默失效 + 反馈环未闭"。
+    - 定案：采纳评审 roadmap 作为后续主线，载体为仓库根 ROADMAP.md（与
+      memory-system-plan.md 分工：plan=系统规范、ROADMAP=工作指引、评审文件=依据）。
+      结构：阶段 A 止血 A1–A11（消灭静默失效，本周）、阶段 B 反馈环 B1–B7（真实
+      query 进评测/使用信号回写/人审吞吐与数据量脱钩，2–4 周）、阶段 C 调优 C1–C8
+      （每项过评测 A/B 才合入）、明确不做清单沿用历次已否决项。每项含产品视角/
+      开发实现/验收三层描述。
+    - 未做项：评审中全部修复尚未实施（本次只产文档）；A11 切窗预算重校准需影子
+      重放实验数据后才切换；B2 相关性阈值依赖 B1 扩容评测标定；B7 历史误归属的
+      一次性重解析脚本标记为可选。
+
+113. ★ **Phase A 止血 A1–A11 全部实施完成（2026-11-26）。**
+    - 范围与验证：评审 #112 的阶段 A 十一项全部落地，alembic 0007_phase_a_hardening
+      （jobs.next_retry_at / route_checkpoints 表 / memory_events 三列唯一索引 /
+      living_doc_history.proposal_id 部分唯一索引，两库升级成功）；全量 pytest
+      576 passed / 0 failed（memxy_test 独立库重建 + alembic head）。ROADMAP 状态
+      全部翻转 ✅。
+    - 关键实现决策：
+      - A5 偏离 ROADMAP 原文（用 route_decisions 判重）：改用独立表
+        route_checkpoints(source,session_id,first_msg_id,prompt_ver,model_output)。
+        原因：无 item 的窗口不产生 decision 行，靠它判重会漏窗；checkpoint 表自包含，
+        逐窗成功即短事务落库，重试时命中则 RouteResult.model_validate 直接恢复不再调
+        LLM（stats.restored 计数），_finish 推游标后清理。parse 失败不落 checkpoint
+        （重试可再试 LLM）。
+      - A6 偏离 ROADMAP 原文（anchor_id 恢复 bucket[0].id）：保留 anchor_id=
+        chunk[0].id 不改回——超预算桶切多 chunk 后共享 anchor 会让 source_msg 歧义
+        （决策/事实溯源指向同一行），仅改游标过滤与 done_through 为 rows[-1].id，
+        卡死路径（锚点不推进→窗口永被过滤）已消除并有超预算桶单测覆盖。
+      - A4 幻觉校验口径：valid_ids 取 rerank(fact) 的 top5（LLM 实际见过的候选集），
+        而非 candidates 全集（20）；幻觉引用→invalid_refs 计数 + 按 ADD 兜底 +
+        log.warning；UPDATE/DELETE rowcount==0 同计 invalid_refs，DELETE 兜底 ADD
+        保素材不丢。
+      - A2-② 放弃单次 encode 拼接：bge-m3 max_seq_length=128（≈110-120 汉字）下，
+        query+summary 拼接必被右截断、summary 全丢。改为两次 encode 加权混合
+        （query 段 300 字符 ×0.75 + summary 120 字符/project ×0.25，再 L2 归一化），
+        实测延迟翻倍仍在我预算内；query_text 原拼接保留给 recall_log 审计。
+      - A7 memory_events 去重教训：生产库 15 组重复事件，键是
+        (memory_id,action,source_msg) 三列——同键不同 content 的行是回填双写产物，
+        按全列等值去重会撞唯一冲突；0007 先按三列去重再建唯一索引，_event 改
+        ON CONFLICT DO NOTHING。已知取舍：同窗口两条同 action 事件第二条被丢
+        （极罕见，UPDATE 本身幂等覆盖，无数据损害）。
+      - A7 extraction_cursor 的 GREATEST 必须条件化：prompt_ver 相同才取
+        GREATEST(旧,新)，换版全量重判时直接用新值——否则旧游标顶住新游标，
+        中间窗口被跳过。
+      - A9 清理口径定案：conversation_log 按 orgs.retention_days（NULL→cleanup
+        配置 180 天兜底，0=永不清）+游离行按兜底；时间取 coalesce(msg_ts,
+        ingested_at)；NOT EXISTS 保护 memories/raw_observations/pending_items/
+        route_decisions 四表引用（memories/raw_observations 有 FK，后两者无 FK
+        但保审计可追溯）。recall_log/llm_usage/route_decisions/jobs(done,failed)
+        按 cleanup.older_days=90 天滚动；memory_events 是记忆审计链不清；metrics
+        聚合表本轮不做。触发：worker 启动 + scan handler 调 maybe_enqueue_daily
+        （24h 内不重复，dedup_key=cleanup:UTC日期）。
+      - A11 实验结论：bench_token_budget.py 对 20 个最活跃会话
+        {12000,40000} 影子重放——830→820 窗仅省 1%，窗口数由锚点结构（
+        TURN_RADIUS=2 轮距）主导而非 token 预算；评审"3.8h→1.3h"估算不成立，
+        维持 TOKEN_BUDGET=12000 不切换。脚本留 bench/ 供 B 阶段复用。
+      - A1 补充：bootstrap 开头 _reset_session_state（anonymous 也统一清，无害）；
+        A3 头 2000+尾 1000+截断提示 ≈3020 字符 < 4000 上限，服务端 read.py 不动；
+        A2-① transcript 尾部 64KB 倒序找最后一条 assistant 文本（坏 JSONL/无
+        transcript 容错返回 None）；A2-③ MCP memory_recall 加同款可选参数。
+    - 教训：① 测试里 app.core.db 模块不能当 psycopg conn 传给内部用
+      conn.execute().fetchone() 的函数（AttributeError 'int' object）——统一
+      with db.transaction() as tx 传真连接；② PowerShell 正则批量替换修 md 文档
+      易丢行（A1–A11 状态行被吞），改 Python 全文 replace 补回；③
+      llm_usage/route_decisions/pending_items 等表 INSERT 测试造数前先查
+      0001/0003 迁移的实际列（recall_log 无 query 列、llm_usage 无 endpoint 列、
+      pending_items 无 kind/content 列、model_output NOT NULL）。
+    - 未做项：A11 评测集"连续指代"对比用例（≥10 条）并入 B1 扩容一起做；A9 的
+      metrics 聚合表；B1–B7 全部（下一阶段）。
+    - 补记（同日 16:16）：服务重启与生产冒烟完成——service.ps1 restart backend +
+      start worker（worker 自 11-15 起一直停止，本次一并拉起）；cleanup job 首跑
+      done（16:13）；/v1/recall 带 prev_assistant_summary 冒烟 200 / 239ms；
+      write_facts 生产日志已出现新统计字段 invalid_refs=0，积压 route×3 +
+      write_facts×14 + cleanup×1 全部 done，无一失败。
+
+114. ★ **Phase B 前三项完成：B1 评测扩容底座 + B2 相关性门槛 + B3 使用回写（2026-11-27）。**
+    - B1（评测扩容底座，扩到 300 条的人工标注留给人做）：
+      - 0008_eval_hashes 迁移（两库）：eval_recall_cases 补 expected_hashes/
+        must_not_hashes 两列——判定从"钉死 memory id"改为 content_hash 前缀命中，
+        记忆被合并/重写后评测不再静默假阴性；parse/import 时 id 与 hash 混合兼容。
+      - eval.py：run_eval 判定走 hash（无 hash 用例退化用 id）；--check 健康检查
+        （hash 判重 + 期望记忆 active/存在性 → stale 清单）；--harvest N 从
+        recall_log 采真实 query 写 eval-candidates.md（_flat 压平多行 query +
+        400 字符截断，贴 JSON 的原样 query 不是好评测题）；config 快照
+        （k/pool/rrf_k/权重/阈值/用例数）进 eval_runs 可归因。
+      - service.ps1 加 eval 常规动作（evalArgs 透传任意子命令）。
+      - test_evaluation.py 22→33 用例（hash 解析/判定/协议/Judgment 集成）。
+    - B2（相关性门槛，R1）：settings 新键 recall.min_cosine=0.5（0=关闭）；
+      recall() 在 fuse 前 dense 过滤 dist<=阈值（bge-m3 归一化向量，dist∈[0,2]，
+      未归一化余弦距离可绝对判断——score() 批内归一 top-1 恒 1.0 不能做阈值）；
+      全空时"本轮注入为空"是一等公民结果；keyword 通道精确标识符命中不过滤。
+      寒暄/超短 query 零注入有单测覆盖（否定例 leak=0）。
+    - B3（使用回写，R2）：定案"并入召回同事务"（不设独立任务/队列——回写是单条
+      UPDATE memories SET last_seen_at=now() WHERE id=ANY(... AND status='active')，
+      走主键批量亚毫秒，独立任务反而引入失败面与延迟；读路径零 LLM 边界不动）。
+      只回写实际注入的 top-K；write_log=False（评测）不回写；不碰 updated_at
+      （不伪造"记忆被修改"）；不写 memory_events（CHECK 约束只容四动作，使用审计
+      已在 recall_log.injected_ids）。衰减公式本身未改（后续 Phase C 校准项）。
+    - ★ 评测基线过期结论（重要）：B2 回归判读时发现 hit@5 从基线 0.904（11-10）
+      掉到 0.55，三组对照证明与 B2 无关：①关阈值 0.543 vs 开 0.553（中性偏正，
+      p95 210ms 更优）；②纯 query 向量（关 A2-② 混合）0.553 不变；③深挖 case#3
+      expected=33 仍 active 但排 top-20 第 6 位——语料自 11-10 起翻数倍（现 id
+      4296+），新记忆把期望答案挤出 top-5，且部分 expected id 已被合并/重写。
+      **0.904 基线不可比，需用 B1 的 hash 口径重建基线**；B2 完成判据"hit@5
+      不回归"按对照口径成立。
+    - 教训：Settings 属性是 .dsn 不是 db_dsn；pwsh 内嵌 SQL 的 * 会被当通配符
+      解析（参数化查询绕开）；service.ps1 param ValidateSet 会把 -参数 按位置
+      吃进 $Target（去掉 ValidateSet 用 notmatch 拼 evalArgs，restore -DbName
+      同病顺带修）；哈希词袋下 query↔content cos=0 是常态，B2 后测试造数必须
+      让 query token 原样出现在 content 或走 kw 通道（no_real_model 词表扩到
+      14 词）。
+    - 未做项：B4/B5/B6/B7；评测扩容到 300 条的人工标注；衰减公式校准（Phase C）。
+
+115. ★ **Phase B 反馈环 B4–B7 收官：全量回归通过、Phase B 7/7 完成（2026-11-27）。**
+    - 接 #114。B4–B7 全部实施并验证，全量 pytest 通过后 Phase B 收官。
+    - B4（去重放宽，S5）：复核确认前轮已实施——① facts.py _BUCKET_WHERE 放宽为
+      (scope, org, project)，subject/role 降级为 TAG_BONUS=0.002 排序加分（候选
+      查询 tag_match 列 + boosted 排序，prompt 同步改"同分区近邻"）；② 新模块
+      dedup_scan.py 周期近重复合并扫描（142 行）：同 (scope,org,project) 分区
+      embedding 近邻（阈值 dedup.similarity=0.90 ⇔ dist≤0.10）出 stage='dedup'
+      裁决卡（dedup_hash='merge:<a>:<b>' 部分唯一索引幂等；failed 卡复活重送；
+      rejected 对不再出卡）；**永不自动合并**——余弦分不开"重复"和"超集"，
+      判同一件事的是人；worker 接线 + 24h 节流 + config 段（similarity/max_cards）。
+      review.py _merge_pair：keep/drop 按 id 排序（保留老记忆带 mention 历史）、
+      双行 FOR UPDATE、任一行非 active bounce pair_not_active、人改文案重算
+      embedding+keywords 两行并集（不全量替换）+ mention 合并 + UPDATE 事件、
+      drop 行软删。
+    - B5（审核提速，S9）三件套：① 审核页"按栏位聚簇"视图——Pending.jsx 加
+      ClusteredCards（(stage, section_key) 归堆渲染，纯前端不加端点）+ 视图切换
+      按钮；② 键盘流——PendingCard 改 forwardRef+useImperativeHandle 暴露
+      approve/reject/adopt，主组件 document keydown：j/k 选卡（scrollIntoView
+      nearest + .card.is-active 高亮）、1 批准、2 否决、3 采用原判、Esc 取消；
+      INPUT/TEXTAREA/SELECT 聚焦或 .modal-overlay 打开时让位；③ 重复白名单
+      auto_repeat（router.py _queue_for_review）：INSERT pending 前判
+      _auto_repeat_ok——同分区同栏位 raw_observations 近邻（embedding<=>
+      1-0.92）positive≥3（auto_repeat.min_seen）且 negative=0（人工否决过的
+      边界不自动跨）→ 免审落库 status='approved'/resolved_by='auto_repeat' +
+      直接排 apply_decision job（resolution={}）；向量来自
+      _precompute_section_embeddings 预计算 dict（编码绝不进写事务 §5.5）；
+      RouteStats 加 auto_approved 并入 _COUNTED。★计数修坑：stats.pending 在
+      _queue_for_review 开头无条件 +1，auto 分支须 stats.pending -= 1 免得
+      双算（免审不算"送人工审"，_COUNTED 总量守恒）。
+    - B6（注入信号，S8③）：0009 迁移 recall_log 加 feedback TEXT CHECK
+      ('useful','useless') + 部分索引 recall_log_useless_idx；POST
+      /recall-log/{id}/feedback（pattern 校验、null=撤销、404 log_not_found）；
+      GET /recall-log 带回 feedback；前端召回记录行内 👍/👎 一键标记（再点同
+      一个=撤销，stopPropagation 防触发展开）；eval --harvest 重写：useless 行
+      优先采样（ORDER BY created_at DESC LIMIT n）不足再按原 DISTINCT ON 补
+      常规行——"负标记=用户亲手说带错了，最高价值出题素材"。
+    - B7（数据正确性收口）：复核确认前轮已实施——① review.py _hand_to_writer
+      中 project scope 无 project_key → bounce no_project_key（提示先归属页定
+      key 或改 scope），不再静默跳过；② attribution.py _invalidate_rule_cache：
+      upsert_rule/delete_rule 后 DELETE FROM workspace_map WHERE
+      resolved_by<>'human'（人工确认保留），下次 resolve() 现判。
+    - 验证：test_router 24 passed（B5-③ 4 用例：3 近邻 auto 放行+job 语义/
+      人工否决拦截/2 近邻不够/他项目近邻不计）；test_api_read 11 passed（B6
+      feedback 往返+422/404）；test_evaluation 34 passed（TestHarvest useless
+      优先/普通补齐/eval-runner 行绝不出现）；前端 vite build 通过（63 modules）。
+      B2 阈值连带修了 test_api_read 两用例（query 改带 content 原文过 0.5 门槛）。
+    - 教训：jobs.payload->>'pending_id' 是 text，与 bigint 比较要 id::text；
+      _precompute_section_embeddings 是函数内 import，monkeypatch 要 patch
+      app.core.embedding 模块属性。
+    - 未做项：评测 300 条人工标注 + hash 口径基线重建；B5 积压处理时间对比
+      数字（完成判据的"较 11-11 口径明显下降"）待自然积累一周后回填；Phase C
+      未启动。A1–A11+B1–B7 全部未 commit（最后 commit 0b4d9a6 #110）。
+
+
