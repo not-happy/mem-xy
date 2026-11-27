@@ -3,9 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
-    <meta name="theme-color" content="#0a0d13" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f5f6f8" />
     <title>mem-xy · 记忆观测台</title>
+    <script>
+      /* 主题防闪烁：首帧前读 localStorage 设 data-theme（默认亮色）。 */
+      try { document.documentElement.dataset.theme = localStorage.getItem('memxy-theme') || 'light' } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

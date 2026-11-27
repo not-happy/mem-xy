@@ -4,11 +4,10 @@ import Badge from '../components/Badge.jsx'
 import EmptyState from '../components/EmptyState.jsx'
 import { fmtDateTime } from '../utils/format.js'
 
-/* 驾驶舱：自动化的第一屏。不是「待办中心」的换皮——它回答的是
- * 「机器现在干到哪了、哪里需要我」。三个信息层：
- *   ① 流水线 flow：采集 → 路由 → 双判共识 → 写入 → 召回，节点亮灯 = 有活动；
- *   ② KPI 行：自动化率 / 召回质量 / token 消耗 / 队列积压；
- *   ③ 例外队列 + 系统体征：人需要处理的东西只有这里出现的几行。
+/* 流水线画布：整个应用的主界面（不再是「驾驶舱」页面）。
+ * 全屏只有一张流水线——采集 → 路由 → 双判共识 → 写入 → 召回——节点亮灯 = 有活动，
+ * 点任意节点弹出对应视图的抽屉；下方 KPI 行 + 例外队列 + 系统体征回答
+ * 「机器现在干到哪了、哪里需要我」。人需要处理的东西只有例外队列那几行。
  * 数据全部来自既有只读端点（healthz / workers / jobs / pending / proposals / metrics）。
  * 安静时 30s 轮询，队列有活时 10s——与 Jobs/Metrics 页同款策略。 */
 
@@ -17,7 +16,7 @@ const sumByStatus = (byStatus, pred) => Object.entries(byStatus || {})
   .filter(([k]) => pred(k))
   .reduce((n, [, v]) => n + v, 0)
 
-export default function Cockpit({ onNavigate }) {
+export default function Pipeline({ onOpen }) {
   const [snap, setSnap] = useState(null)
   const [error, setError] = useState(null)
   const [updatedAt, setUpdatedAt] = useState(null)
@@ -76,7 +75,7 @@ export default function Cockpit({ onNavigate }) {
     <div>
       {error && <div className="alert alert-error">{error}</div>}
 
-      {/* ① 流水线 flow */}
+      {/* ① 流水线画布：五个节点全部可点，点开对应抽屉 */}
       <div className="flow mb-12">
         <FlowNode
           label="采集 · 消费"
@@ -85,6 +84,7 @@ export default function Cockpit({ onNavigate }) {
           tone={aliveWorkers > 0 ? 'ok' : 'bad'}
           dot={aliveWorkers > 0 ? 'ok' : 'bad'}
           live={aliveWorkers > 0}
+          onClick={() => onOpen('conversations')}
         />
         <FlowLink live={jobsLive > 0} />
         <FlowNode
@@ -94,6 +94,7 @@ export default function Cockpit({ onNavigate }) {
           tone={jobsLive > 0 ? 'accent' : undefined}
           dot={jobsLive > 0 ? '' : 'off'}
           live={jobsLive > 0}
+          onClick={() => onOpen('observations')}
         />
         <FlowLink live={pendingNow > 0} warn />
         <FlowNode
@@ -103,7 +104,7 @@ export default function Cockpit({ onNavigate }) {
           tone={pendingNow > 0 ? 'warn' : 'ok'}
           dot={pendingNow > 0 ? 'warn' : ''}
           live={pendingNow > 0}
-          onClick={() => onNavigate('pending')}
+          onClick={() => onOpen('pending')}
         />
         <FlowLink live={failedNow + (jobs.failed || 0) > 0} bad />
         <FlowNode
@@ -113,7 +114,7 @@ export default function Cockpit({ onNavigate }) {
           tone={failedNow + (jobs.failed || 0) > 0 ? 'bad' : 'ok'}
           dot={failedNow + (jobs.failed || 0) > 0 ? 'bad' : ''}
           live={failedNow + (jobs.failed || 0) > 0}
-          onClick={() => onNavigate('jobs')}
+          onClick={() => onOpen('memories')}
         />
         <FlowLink live={(lat?.p95_ms || 0) > 400} bad />
         <FlowNode
@@ -123,7 +124,7 @@ export default function Cockpit({ onNavigate }) {
           tone={(lat?.p95_ms || 0) > 400 ? 'bad' : 'ok'}
           dot={(lat?.p95_ms || 0) > 400 ? 'bad' : ''}
           live={(lat?.p95_ms || 0) > 400}
-          onClick={() => onNavigate('recall')}
+          onClick={() => onOpen('recall')}
         />
       </div>
 
@@ -169,13 +170,13 @@ export default function Cockpit({ onNavigate }) {
           <div className="mt-8">
             <ExRow num={pendingNow} tone={pendingNow > 0 ? 'warn' : 'ok'}
                    title="分歧卡 · 待确认" hint="两遍判定不一致才轮到你，键盘流 j/k/1/2/3"
-                   onClick={() => onNavigate('pending')} />
+                   onClick={() => onOpen('pending')} />
             <ExRow num={failedNow} tone={failedNow > 0 ? 'bad' : 'ok'}
                    title="落库失败" hint="批过了但写库炸了，比分歧卡更急"
-                   onClick={() => onNavigate('pending')} />
+                   onClick={() => onOpen('pending')} />
             <ExRow num={proposalsNow} tone={proposalsNow > 0 ? 'warn' : 'ok'}
                    title="待审 diff · 成文规范" hint="汇总器合成的规范改动，逐段采纳/否决"
-                   onClick={() => onNavigate('proposals')} />
+                   onClick={() => onOpen('proposals')} />
             {pendingNow + failedNow + proposalsNow === 0 && (
               <EmptyState title="例外队列清空" hint="系统全自动运转中，无事需人处理。" />
             )}
@@ -235,7 +236,7 @@ function FlowNode({ label, num, sub, tone, dot, live, onClick }) {
 }
 
 function FlowLink({ live, warn, bad }) {
-  const color = bad ? 'rgba(248,113,113,.5)' : warn ? 'rgba(251,191,36,.5)' : undefined
+  const color = bad ? 'rgba(220,38,38,.45)' : warn ? 'rgba(217,119,6,.5)' : undefined
   return (
     <span
       className={`flow-link ${live ? 'live' : ''}`}

@@ -1966,3 +1966,12 @@ meta、ADD 动作显示「（新建，无原文）— → 提议」+ 逐条/批�
     - 其余改动：Sidebar 加 rail-foot 实时脚注（后端/embedding/worker/AUTOPILOT ON）；App.jsx 五组导航 + useWorkers 轮询；Pending.jsx 文案改"分歧裁决"叙事 + llm_review 第二遍意见升级为青绿面板；index.html title「mem-xy · 记忆观测台」+ color-scheme dark。
     - 验证：npx vite build 通过（63 modules / dist css 20.12K + js 268.87K）；headless Edge 截图冒烟：驾驶舱真实数据全接通（后端在线/embedding 热 95.29ms·行/worker 2/4/分歧卡 136/自动化率 86.2%/hit@5 55%/p95 449.5ms 超预算标红——驾驶舱如实暴露了这两个真实问题，正是它的设计目的）。后端 StaticFiles 托管 dist，改 dist 即生效无需重启。
     - 未做项：Pending 聚簇视图未按新视觉重排（逻辑原样保留）；驾驶舱"自动化率"口径与 #116 双判一致率统计是两个数，Phase C 统一指标页时再对齐；proposals/orgs/sections 等次要视图只吃全局换肤未做专属重排。
+
+118. ★ **前端二次重构：单屏流水线画布 + 亮色默认主题（抽屉化 IA v2）（2026-11-27）。**
+    - 起因：用户对 #117 的批评（m02960）：「我看着太黑了，布局上我发现你并未进行大刀阔斧的改革，对于现在的记忆系统，这套UI和布局以及菜单管理是否还适用？」——承认首版是"深色换皮、侧栏骨架未动"。用户在两项选择中定案：主题=亮色默认+深色开关；信息架构=最激进项「单屏流水线画布，其余全部收进抽屉」。
+    - 诊断：旧 admin 壳是"人逐页处理队列"时代的形状；双判共识制（#116）之后系统绝大多数判定全自动，人只处理例外，UI 应从"逐页处理"转向"监督+例外裁决"。
+    - 视觉 v2：亮色默认（--bg-0 #f5f6f8 白瓷底 + --accent #0d9488 白昼青绿 + 坐标纸网格底纹），[data-theme="dark"] 整块覆盖保留 #117 的 Observatory dark（#0a0d13 石墨 + #2dd4bf 磷光青绿）；顶栏 🌙/☀️ 切换写 localStorage('memxy-theme')，index.html 内联脚本首帧前设 data-theme 防闪烁。全部颜色走 CSS token，双主题一套规则。
+    - 信息架构 v2（大刀阔斧部分）：删掉左侧栏与 15 个平级页面。主界面=全屏流水线画布 Pipeline.jsx（采集→路由→双判共识→写入→召回，五节点实时数字+状态灯，全部可点）；其余 14 个视图收进右侧抽屉 Drawer.jsx（ESC/点遮罩关闭），按流水线阶段分组：采集·会话存档 / 路由·观察池 / 双判·例外裁决（分歧裁决+待审 diff，960px 宽抽屉）/ 写入·落库结果（记忆库+成文规范+任务队列）/ 召回·注入 / 质量·调优（指标+重跑）/ 系统（归属+词表+组织+设置）。org/project 分区选择器留在顶栏常驻。Sidebar.jsx、Cockpit.jsx、Inbox.jsx 三个文件删除。
+    - 抽屉内视图组件零逻辑改动（Pending 的键盘流/聚簇/llm_review 面板、Metrics 的图表全部原样），只换容器；hash 路由仍用原 key（#/pending 等直接开对应抽屉），旧 #/inbox、#/cockpit 自动落画布。
+    - 验证：npx vite build 通过（63 modules / dist css 22.09K + js 269.05K）；headless Edge 截图双主题冒烟（暗色经 dist 跳板页 __settheme.html 设 localStorage 后重定向截图，用毕即删）：亮/暗两版画布真实数据全接通（双判 136 琥珀 / 写入失败 12 红 / 召回 p95 448.7ms 超预算红 / 自动化率 86.2% / hit@5 55% / 体征+例外队列完整）。写节点 12 与例外行"落库失败 0"的口径差异沿 #117（jobs.failed vs pending/failed），非本次引入。
+    - 未做项：Pending 聚簇视图未按新视觉重排（沿 #117）；次要抽屉视图（Orgs/Sections/Attribution 等）仅换肤未重排；画布 KPI"自动化率"与双判一致率统计口径统一仍留 Phase C。

@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api.js'
-import Sidebar from './components/Sidebar.jsx'
 import OrgProjectPicker from './components/OrgProjectPicker.jsx'
+import Drawer from './components/Drawer.jsx'
 import { ToastProvider, useToast } from './components/Toast.jsx'
 import { useHashTab } from './hooks/useHashTab.js'
-import Cockpit from './views/Cockpit.jsx'
+import Pipeline from './views/Pipeline.jsx'
 import Pending from './views/Pending.jsx'
 import LivingDocs from './views/LivingDocs.jsx'
 import Proposals from './views/Proposals.jsx'
@@ -20,56 +20,90 @@ import Replay from './views/Replay.jsx'
 import Sections from './views/Sections.jsx'
 import Settings from './views/Settings.jsx'
 
-/* 导航 IA（自动化优先重构）：机器干的放驾驶舱一眼看全，人只进「例外处理」裁
- * 双判分歧卡；记忆内容 / 质量调优 / 系统维护按使用频率降频排后。
- * key 同时是 hash 路由段（#/cockpit）与视图开关。 */
-const NAV_GROUPS = [
-  {
-    title: '驾驶舱',
-    items: [
-      { key: 'cockpit', label: '驾驶舱' },
-    ],
+/* IA v2（单屏流水线画布）：没有侧栏、没有 15 个平级页面。主界面只有一张流水线
+ * 画布（Pipeline），其余视图全部收进右侧抽屉，按流水线阶段分组：
+ *   采集→会话存档；路由→观察池；双判→分歧裁决/待审 diff；写入→记忆库/成文规范/
+ *   任务队列；召回→召回调试。顶栏的「质量」「系统」按钮打开低频工具抽屉。
+ * key 仍是 hash 路由段（#/pending），旧链接（#/inbox、#/cockpit）落到画布。 */
+const DRAWER_GROUPS = {
+  conversations: {
+    title: '采集 · 会话存档', tabs: [{ key: 'conversations', label: '会话存档' }],
   },
-  {
-    title: '例外处理',
-    items: [
-      { key: 'pending', label: '分歧裁决' },
-      { key: 'proposals', label: '待审 diff' },
-    ],
+  observations: {
+    title: '路由 · 观察池', tabs: [{ key: 'observations', label: '观察池' }],
   },
-  {
-    title: '记忆流水线',
-    items: [
-      { key: 'docs', label: '成文规范' },
-      { key: 'observations', label: '观察池' },
-      { key: 'memories', label: '记忆库' },
-      { key: 'conversations', label: '会话存档' },
-    ],
+  pending: {
+    title: '双判 · 例外裁决',
+    tabs: [{ key: 'pending', label: '分歧裁决' }, { key: 'proposals', label: '待审 diff' }],
   },
-  {
-    title: '质量与调优',
-    items: [
-      { key: 'recall', label: '召回调试' },
-      { key: 'metrics', label: '指标' },
-      { key: 'replay', label: '重跑' },
-    ],
+  proposals: {
+    title: '双判 · 例外裁决',
+    tabs: [{ key: 'pending', label: '分歧裁决' }, { key: 'proposals', label: '待审 diff' }],
   },
-  {
+  memories: {
+    title: '写入 · 落库结果',
+    tabs: [{ key: 'memories', label: '记忆库' }, { key: 'docs', label: '成文规范' }, { key: 'jobs', label: '任务队列' }],
+  },
+  docs: {
+    title: '写入 · 落库结果',
+    tabs: [{ key: 'memories', label: '记忆库' }, { key: 'docs', label: '成文规范' }, { key: 'jobs', label: '任务队列' }],
+  },
+  jobs: {
+    title: '写入 · 落库结果',
+    tabs: [{ key: 'memories', label: '记忆库' }, { key: 'docs', label: '成文规范' }, { key: 'jobs', label: '任务队列' }],
+  },
+  recall: {
+    title: '召回 · 注入', tabs: [{ key: 'recall', label: '召回调试' }],
+  },
+  metrics: {
+    title: '质量 · 调优', tabs: [{ key: 'metrics', label: '指标' }, { key: 'replay', label: '重跑' }],
+  },
+  replay: {
+    title: '质量 · 调优', tabs: [{ key: 'metrics', label: '指标' }, { key: 'replay', label: '重跑' }],
+  },
+  attribution: {
     title: '系统',
-    items: [
+    tabs: [
       { key: 'attribution', label: '归属管理' },
       { key: 'sections', label: '词表' },
       { key: 'orgs', label: '组织管理' },
-      { key: 'jobs', label: '任务队列' },
       { key: 'settings', label: '设置' },
     ],
   },
-]
+  sections: {
+    title: '系统',
+    tabs: [
+      { key: 'attribution', label: '归属管理' },
+      { key: 'sections', label: '词表' },
+      { key: 'orgs', label: '组织管理' },
+      { key: 'settings', label: '设置' },
+    ],
+  },
+  orgs: {
+    title: '系统',
+    tabs: [
+      { key: 'attribution', label: '归属管理' },
+      { key: 'sections', label: '词表' },
+      { key: 'orgs', label: '组织管理' },
+      { key: 'settings', label: '设置' },
+    ],
+  },
+  settings: {
+    title: '系统',
+    tabs: [
+      { key: 'attribution', label: '归属管理' },
+      { key: 'sections', label: '词表' },
+      { key: 'orgs', label: '组织管理' },
+      { key: 'settings', label: '设置' },
+    ],
+  },
+}
 
-const TAB_KEYS = NAV_GROUPS.flatMap((g) => g.items.map((it) => it.key))
-const TAB_LABELS = Object.fromEntries(NAV_GROUPS.flatMap((g) => g.items.map((it) => [it.key, it.label])))
-/* 这些页是全库视角，不消费 org/project 分区——选择器置灰，避免「改了没反应」的困惑。 */
-const NO_PARTITION = new Set(['cockpit', 'attribution', 'orgs', 'sections', 'replay', 'settings', 'jobs'])
+const DRAWER_KEYS = Object.keys(DRAWER_GROUPS)
+/* 这些视图是全库视角，不消费 org/project 分区——选择器置灰，避免「改了没反应」的困惑。 */
+const NO_PARTITION = new Set(['attribution', 'orgs', 'sections', 'replay', 'settings', 'jobs'])
+/* 分歧裁决/待审 diff 内容宽，给更宽的抽屉。 */
+const WIDE_DRAWER = new Set(['pending', 'proposals'])
 
 export default function App() {
   return (
@@ -80,63 +114,102 @@ export default function App() {
 }
 
 function Shell() {
-  const [tab, setTab] = useHashTab('cockpit', TAB_KEYS)
+  const [tab, setTab] = useHashTab('cockpit', ['cockpit', ...DRAWER_KEYS])
   // ★ 分区（org/project）在顶层管：多个视图都要按它过滤，放各自组件里会重复多份状态。
   const [org, setOrg] = useState('dida')
   const [project, setProject] = useState('')
   const health = useHealth()
-  const workers = useWorkers()
-  const [counts, refreshCounts] = useTodoCounts(org, project)
+  const [theme, toggleTheme] = useTheme()
 
   // 分区变了要给子视图一个信号去重新拉数据。用 key 强制重挂，比传 useEffect 依赖简单。
   // project 由 OrgProjectPicker 内部防抖 300ms 后才上报，连敲不会每字符重挂载。
   const partition = { org_key: org || undefined, project_key: project || undefined }
   const partitionKey = `${org}|${project}`
-  const noPartition = NO_PARTITION.has(tab)
+
+  const drawerKey = DRAWER_GROUPS[tab] ? tab : null
+  const group = drawerKey ? DRAWER_GROUPS[drawerKey] : null
+  const open = setTab
+  const close = useCallback(() => setTab('cockpit'), [setTab])
 
   return (
     <div className="layout">
-      <Sidebar
-        groups={NAV_GROUPS}
-        tab={tab}
-        onNavigate={setTab}
-        counts={counts}
-        status={{ health, workers }}
-      />
-      <div className="main">
-        <header className="topbar">
-          <h1>{TAB_LABELS[tab]}</h1>
-          <div className="spacer" />
-          <OrgProjectPicker
-            org={org}
-            project={project}
-            onOrg={setOrg}
-            onProject={setProject}
-            disabled={noPartition}
-          />
-          <HealthBadge health={health} />
-        </header>
+      <header className="topbar">
+        <span className="brand">
+          <span className="brand-dot" />
+          mem-xy <span className="muted">记忆观测台</span>
+        </span>
+        <div className="spacer" />
+        <OrgProjectPicker
+          org={org}
+          project={project}
+          onOrg={setOrg}
+          onProject={setProject}
+          disabled={drawerKey != null && NO_PARTITION.has(drawerKey)}
+        />
+        <button
+          className="btn ghost sm theme-btn"
+          onClick={toggleTheme}
+          title={theme === 'light' ? '切到暗色' : '切到亮色'}
+        >
+          {theme === 'light' ? '🌙' : '☀️'}
+        </button>
+        <HealthBadge health={health} />
+      </header>
 
-        <main className="content">
-          {tab === 'cockpit' && <Cockpit onNavigate={setTab} />}
-          {tab === 'pending' && <Pending key={partitionKey} partition={partition} onDecided={refreshCounts} />}
-          {tab === 'proposals' && <Proposals key={partitionKey} partition={partition} onDecided={refreshCounts} />}
-          {tab === 'docs' && <LivingDocs key={partitionKey} partition={partition} />}
-          {tab === 'observations' && <Observations key={partitionKey} partition={partition} />}
-          {tab === 'memories' && <Memories key={partitionKey} partition={partition} />}
-          {tab === 'conversations' && <Conversations key={partitionKey} partition={partition} />}
-          {tab === 'attribution' && <Attribution />}
-          {tab === 'recall' && <RecallDebug key={partitionKey} partition={partition} />}
-          {tab === 'metrics' && <Metrics key={partitionKey} partition={partition} />}
-          {tab === 'jobs' && <Jobs />}
-          {tab === 'orgs' && <Orgs />}
-          {tab === 'sections' && <Sections />}
-          {tab === 'replay' && <Replay />}
-          {tab === 'settings' && <Settings />}
-        </main>
-      </div>
+      <main className="content">
+        <Pipeline onOpen={open} />
+      </main>
+
+      {drawerKey && (
+        <Drawer
+          title={group.title}
+          tabs={group.tabs}
+          activeTab={drawerKey}
+          onTab={setTab}
+          width={WIDE_DRAWER.has(drawerKey) ? 960 : 880}
+          onClose={close}
+        >
+          {renderView(drawerKey, partitionKey, partition, health)}
+        </Drawer>
+      )}
     </div>
   )
+}
+
+/* 抽屉内容：视图 key → 组件。与旧版逐 tab 渲染一一对应，仅换了容器。 */
+function renderView(key, partitionKey, partition) {
+  switch (key) {
+    case 'conversations': return <Conversations key={partitionKey} partition={partition} />
+    case 'observations': return <Observations key={partitionKey} partition={partition} />
+    case 'pending': return <Pending key={partitionKey} partition={partition} />
+    case 'proposals': return <Proposals key={partitionKey} partition={partition} />
+    case 'memories': return <Memories key={partitionKey} partition={partition} />
+    case 'docs': return <LivingDocs key={partitionKey} partition={partition} />
+    case 'jobs': return <Jobs />
+    case 'recall': return <RecallDebug key={partitionKey} partition={partition} />
+    case 'metrics': return <Metrics key={partitionKey} partition={partition} />
+    case 'replay': return <Replay />
+    case 'attribution': return <Attribution />
+    case 'sections': return <Sections />
+    case 'orgs': return <Orgs />
+    case 'settings': return <Settings />
+    default: return null
+  }
+}
+
+/* 主题：亮色默认，切换写 localStorage('memxy-theme') 并同步 <html data-theme>。
+ * 初始值由 index.html 的内联脚本在首帧前设好（防闪烁），这里只负责切与读。 */
+function useTheme() {
+  const [theme, setTheme] = useState(() => document.documentElement.dataset.theme || 'light')
+  const toggle = useCallback(() => {
+    setTheme((t) => {
+      const next = t === 'light' ? 'dark' : 'light'
+      document.documentElement.dataset.theme = next
+      try { localStorage.setItem('memxy-theme', next) } catch { /* 隐私模式忽略 */ }
+      return next
+    })
+  }, [])
+  return [theme, toggle]
 }
 
 /* 健康 30s 轮询；状态翻转（好→坏 / 坏→好）时 toast 提醒一次，避免「页面静默变空」无人察觉。 */
@@ -170,53 +243,6 @@ function useHealth() {
   }, [toast])
 
   return health
-}
-
-/* worker 在岗 30s 轮询：只喂侧边栏脚注（x/max 在岗），失败静默。 */
-function useWorkers() {
-  const [workers, setWorkers] = useState(null)
-  useEffect(() => {
-    let alive = true
-    const load = () => api.listWorkers()
-      .then((w) => { if (alive) setWorkers(w) })
-      .catch(() => { if (alive) setWorkers(null) })
-    load()
-    const t = setInterval(load, 30000)
-    return () => { alive = false; clearInterval(t) }
-  }, [])
-  return workers
-}
-
-/* 侧边栏待办红点：pending 总数 + 待审 proposal 总数，60s 轮询。
- * 与 Cockpit 同源（listPending / listProposals 的 total），失败静默归 0 不干扰。
- * ★ 返回 [counts, refresh]：批准/否决成功后子视图立刻调 refresh 重拉红点，
- *   不用干等 60s 轮询（后端 list_pending 默认只算 pending+failed，裁决后 total 即时变化）。 */
-function useTodoCounts(org, project) {
-  const [counts, setCounts] = useState({})
-  const [tick, setTick] = useState(0)
-  const refresh = useCallback(() => setTick((n) => n + 1), [])
-
-  useEffect(() => {
-    let alive = true
-    const base = { org_key: org || undefined, project_key: project || undefined, limit: 1 }
-    const load = () => {
-      Promise.allSettled([
-        api.listPending(base),
-        api.listProposals({ ...base, status: 'pending' }),
-      ]).then(([p, q]) => {
-        if (!alive) return
-        setCounts({
-          pending: p.status === 'fulfilled' ? (p.value?.total || 0) : 0,
-          proposals: q.status === 'fulfilled' ? (q.value?.total || 0) : 0,
-        })
-      })
-    }
-    load()
-    const t = setInterval(load, 60000)
-    return () => { alive = false; clearInterval(t) }
-  }, [org, project, tick])
-
-  return [counts, refresh]
 }
 
 function HealthBadge({ health }) {
