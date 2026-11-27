@@ -130,6 +130,15 @@ def _handle_dedup_scan(job: dict, conn) -> None:
     log.info("dedup_scan job %s: %s", job.get("id"), result)
 
 
+def _handle_auto_review(job: dict, conn) -> None:
+    """★ 双判共识制：待审卡的第二遍 LLM 复判（app/pipeline/auto_review.py）。
+    LLM 在事务外（§5.5）——不接 conn，auto_review.handle 自管事务。"""
+    from .pipeline import auto_review
+
+    result = auto_review.handle(job["payload"])
+    log.info("auto_review job %s: %s", job.get("id"), result)
+
+
 def maybe_enqueue_cleanup() -> None:
     """★ A9：worker 起来时看一眼要不要补当日 cleanup job（24h 节流 + 当日去重）。"""
     from . import cleanup as cleanup_mod
@@ -166,6 +175,7 @@ HANDLERS: dict = {
     "scan": _handle_scan,
     "cleanup": _handle_cleanup,
     "dedup_scan": _handle_dedup_scan,
+    "auto_review": _handle_auto_review,
 }
 
 _stop = threading.Event()

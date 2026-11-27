@@ -74,6 +74,7 @@ class Settings:
     dedup_scan_max_cards: int
     auto_repeat_similarity: float
     auto_repeat_min_seen: int
+    auto_review_enabled: bool
 
     def endpoint_for(self, task: str) -> str:
         """The single place where a task is mapped to an endpoint (plan §9.1)."""
@@ -138,6 +139,12 @@ _DEFAULTS: dict = {
     #   边界比"省一次点击"值钱得多。similarity 取 0.92，比 dedup_scan 的 0.90
     #   更严：这里是"没有人在场也敢写库"的门槛，不是"值得看一眼"的门槛。
     "auto_repeat": {"similarity": 0.92, "min_seen": 3},
+    # ★ 双判共识制（app/pipeline/auto_review.py）：每张待审卡先过第二遍 LLM
+    #   复判——两遍一致才自动落库（resolved_by='llm_auto'），分歧留人审（分歧详情
+    #   写进 suggestion.llm_review 给人当参考）。enabled=False 退回纯人工模式。
+    #   discard 永不自动（第二遍判 discard 必然是分歧）；merge 卡由 LLM 读全文
+    #   复核（余弦分不开"重复"和"超集"，LLM 分得开——修订 dedup_scan 旧注释）。
+    "auto_review": {"enabled": True},
 }
 
 
@@ -234,6 +241,7 @@ def load_settings() -> Settings:
         dedup_scan_max_cards=int(cfg.get("dedup_scan.max_cards", 50)),
         auto_repeat_similarity=float(cfg.get("auto_repeat.similarity", 0.92)),
         auto_repeat_min_seen=int(cfg.get("auto_repeat.min_seen", 3)),
+        auto_review_enabled=bool(cfg.get("auto_review.enabled", True)),
     )
 
 

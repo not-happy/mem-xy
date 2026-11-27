@@ -202,16 +202,22 @@ def _queue_for_review(conn: Connection, window: Window, item, ctx: SessionCtx,
     #   同一素材不再排出第二套卡（decisions-log #70 承认的缺口）。
     #   stats.pending 仍照加——它统计的是"路由判定送审多少次"，不是"插了几行"。
     #   索引是部分唯一（WHERE dedup_hash IS NOT NULL），推断必须带上同样的谓词。
-    conn.execute(
+    row = conn.execute(
         "INSERT INTO pending_items (org_key, project_key, stage, raw_content, source_msg,"
         "                            suggestion, reason, prompt_ver, status, dedup_hash)"
         " VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s,'pending',%s)"
-        " ON CONFLICT (dedup_hash) WHERE dedup_hash IS NOT NULL DO NOTHING",
+        " ON CONFLICT (dedup_hash) WHERE dedup_hash IS NOT NULL DO NOTHING"
+        " RETURNING id",
         (ctx.org_key, ctx.project_key, "route" if matched else "section",
          text[:4000], window.anchor_id, json.dumps(suggestion, ensure_ascii=False),
          reason, route_prompt.PROMPT_VER,
          _dedup_hash(window.anchor_id, item.kind, text)),
-    )
+    ).fetchone()
+    # ★ 双判共识制（decisions-log #116）：新卡排第二遍 LLM 复判。RETURNING 没
+    #   给 id = 重放撞 dedup_hash，卡已在流程里，不重复排。开关关了就零开销。
+    if row is not None and get_settings().auto_review_enabled:
+        jobs.enqueue("auto_review", {"pending_id": row["id"]},
+                     org_key=ctx.org_key, conn=conn)
 
 
 def _auto_repeat_ok(conn: Connection, ctx: SessionCtx, section_key: str,

@@ -14,9 +14,13 @@ B4-① 放宽了候选分桶（role/subject 不再挡住去重比对），但那
   裁决走 apply_decision 的 merge_pair 分支（app/pipeline/review.py）：
   默认保留 id 较小的一条（老记忆带得动 mention 历史），软删另一条；
   人可以在卡片上改合并文案（resolution.content → 重算向量落库）。
-- **不调用任何 LLM**：阈值只负责"拉出来看一眼"，判"是不是同一件事"的是人。
-  config 里 `thresholds.dedup_prefilter` 的注释说得更狠：余弦分不开"重复"
-  和"超集"——所以这卡永远进人工，不自动合并。
+- ★ 双判共识制（2026-11-27，decisions-log #116）修订了下面这条旧决策：
+  新卡/复活卡排 `auto_review` job，由 LLM 读两条原文裁决——
+  verdict=merge 自动合并、keep_both 自动关卡（不写人工否决记录）。
+  旧口径"这卡永远进人工，不自动合并"的理由是余弦分不开"重复"和
+  "超集"——这仍成立，但那是**向量**的局限；LLM 读全文分得开，且
+  keep_both 是保守出口（拿不准就不合）。人否决过的对不再出卡的
+  规则不变；auto_review.enabled=False 时退回纯人工模式。
 
 已知取舍：
 - 被人否决（rejected）过的对不再出卡（NOT EXISTS 过滤含 rejected）——内容
@@ -109,20 +113,33 @@ def scan(conn) -> dict:
         ).fetchone()
         if card is not None:
             created += 1
+            _maybe_auto_review(conn, card["id"], p["org_key"])
         else:
             # 唯一索引挡住了重插：若现存卡是 failed（系统失败），把它翻回 pending
             # 重新送到人面前——"失败要能重试"靠的是复活旧卡，不是再插一张。
             revived = conn.execute(
                 "UPDATE pending_items SET status='pending', resolved_at=NULL"
-                " WHERE dedup_hash=%s AND status='failed'",
+                " WHERE dedup_hash=%s AND status='failed'"
+                " RETURNING id",
                 (f"merge:{p['a_id']}:{p['b_id']}",),
-            ).rowcount
+            ).fetchone()
             if revived:
                 created += 1
+                _maybe_auto_review(conn, revived["id"], p["org_key"])
 
     log.info("dedup_scan 完成：近邻对 %d，新卡 %d（阈值 %.2f）",
              len(pairs), created, settings.dedup_scan_similarity)
     return {"pairs": len(pairs), "cards": created}
+
+
+def _maybe_auto_review(conn, pending_id: int, org_key: str | None) -> None:
+    """★ 双判共识制：新卡/复活卡排第二遍 LLM 复判（开关关了就零开销）。"""
+    if not get_settings().auto_review_enabled:
+        return
+    from .queue import jobs as jobs_mod
+
+    jobs_mod.enqueue("auto_review", {"pending_id": pending_id},
+                     org_key=org_key, conn=conn)
 
 
 def maybe_enqueue_daily(conn) -> int | None:

@@ -257,6 +257,23 @@ const PendingCard = forwardRef(function PendingCard({ it, action, canDecide, sec
         </div>
       )}
 
+      {s.llm_review && (
+        <div className="my-8">
+          <div className="meta">
+            第二遍意见（两遍判得不一样才到你手上，已按第二遍预填可参考）：
+          </div>
+          <div className="muted">
+            {enumItem('kind', s.llm_review.kind)?.zh || s.llm_review.kind}
+            {typeof s.llm_review.confidence === 'number' && ` · 置信度 ${s.llm_review.confidence.toFixed(2)}`}
+            {s.llm_review.section_key && ` · 栏位 ${secLabel(sections, s.llm_review.section_key)}`}
+            {s.llm_review.content && s.llm_review.content !== s.content && (
+              <div className="diff-new mt-4">{s.llm_review.content}</div>
+            )}
+            {s.llm_review.why && <div>{s.llm_review.why}</div>}
+          </div>
+        </div>
+      )}
+
       {s.section_runner_up && (
         <div className="meta my-4">
           栏位次选：{secLabel(sections, s.section_runner_up)}

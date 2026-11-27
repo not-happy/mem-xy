@@ -1910,4 +1910,50 @@ meta、ADD 动作显示「（新建，无原文）— → 提议」+ 逐条/批�
       数字（完成判据的"较 11-11 口径明显下降"）待自然积累一周后回填；Phase C
       未启动。A1–A11+B1–B7 全部未 commit（最后 commit 0b4d9a6 #110）。
 
+116. ★ **入池审核双判共识制：第二遍 LLM 复判，两遍一致自动落库、分歧留人（2026-11-27）。**
+    - 起因：用户看到 Phase B 后问"前端交互能否做成全自动而无需批准，每条都通过
+      大模型来判定"。给了三方案（双判共识/完全无人审/暂不动），用户选双判共识制：
+      第一遍是 route/查重的机器初筛，第二遍换一个更贵的 LLM 独立复核——两遍判得
+      一致才自动落库，有分歧的才进人工，人审量下降一个数量级而不失守质量。
+    - ★修订 #115 的"永不自动合并"：当时理由是余弦分不开"重复"和"超集"，判同一
+      件事的是人。双判制下这条松动——向量近邻只是提名，第二遍 LLM 读两条原文做
+      verdict（merge/keep_both，不确定一律 keep_both：错误合并会丢真记忆，分开
+      最多多占一行），merge 才自动执行合并，keep_both 自动否决配对（rejected +
+      resolved_by='llm_auto'，不写 negative——reject() 本就不写否决池）。
+    - 实现（新模块 app/pipeline/auto_review.py + prompts/auto_review.py，
+      PROMPT_VER='auto-review-v1'，判类标准与第一遍同源=两问判据+discard 三情形）：
+      - route 卡共识规则（第二遍 JudgeItem：kind+confidence 必填，其余宽松）：
+        ① 第二遍判 discard → 永不自动（待办里第一遍都不是 discard，判 discard
+        必然是分歧）→ 留人；② kind 与第一遍不同 → 实质分歧 → 留人；③
+        atomic_fact 但 scope/subject/role 任一缺 → 留人；④ section_unmatched
+        卡第二遍给不出 section_key → 留人；⑤ 全过 → resolution={kind,
+        resolved_by:'llm_auto', +第二遍补的 scope/subject/role/section_key
+        （仅第一遍没有时）/keywords/content（改写才带）}，直接走 review.approve
+        排 apply_decision。分歧卡：suggestion||{'llm_review': 第二遍意见} + reason
+        追加 '+llm_disagreed:<原因>' 留 pending，前端展示第二遍意见供人参考。
+      - 触发点：router._queue_for_review 普通卡 INSERT 改 RETURNING id（重放撞
+        dedup_hash 不重排），auto_review.enabled 时 enqueue("auto_review",
+        dedup_key='auto_review:<id>')；dedup_scan 新卡/复活卡同款（_maybe_auto_review）。
+        卡已被人审（status!=pending）→ skipped 不花 LLM 调用；LLM 失败异常上抛，
+        卡保持 pending 走 A8 退避重试。
+      - config：auto_review.enabled=True（false=整条链路退回纯人工）。
+      - worker：HANDLERS 注册 auto_review（_handle_auto_review 不接 conn，
+        LLM 在事务外 §5.5）。
+    - 前端：PendingCard 卡片展示 suggestion.llm_review（"第二遍意见"块：类型/
+      置信度/栏位/改写文案/理由）——分歧卡到人手里时已经带着两个模型的判断。
+    - 测试：新 test_auto_review.py 13 用例（一致 observation/atomic_fact 自动落、
+      discard 留人、kind 互换留人、缺 facet 留人、section 补齐/补不出、改写文案
+      通过、merge 自动合并/keep_both 自动否决且不写 negative、LLM 失败卡留
+      pending、已被人工处理 skipped 零调用、开关关 disabled）。★测试基建三坑：
+      tests/ 是包（tests/__init__.py 存在），兄弟模块 import 必须走 tests.test_review；
+      db fixture 在 test_review.py 里，跨文件复用要 pytest_plugins=['tests.test_review']
+      挂载；FakeLLM 要对齐真 structured 的返回契约（schema=JudgeResult 时返回
+      JudgeResult，脚本直写 JudgeItem 由替身自动包装）。
+    - 验证：test_auto_review 13 passed；邻接 test_review+test_router+
+      test_dedup_scan+test_worker_handlers 69 passed；全量 **627 passed in
+      944s**（此前 614 + 新 13）。前端 vite build 通过（63 modules）。
+    - 未做项：auto_review 的独立 prompt 版本灰度/双判一致率统计（Phase C 可加
+      override_stats 同款口径）；第二遍是否换更贵模型（task_endpoints 里给
+      auto_review 单配 endpoint 即可，代码已按 task='auto_review' 预留）。
+
 
