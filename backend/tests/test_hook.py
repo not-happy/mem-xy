@@ -212,6 +212,79 @@ def test_a_non_200_response_injects_nothing(monkeypatch, capsys):
     assert capsys.readouterr().out == ""
 
 
+# ─────────────────────── A1/A2/A3：压缩恢复、上下文增广、超长截断 ───────────────────────
+
+def test_bootstrap_resets_the_injected_list_after_a_compact(isolated_home):
+    """★ A1（S2）：/compact 或 resume 后 SessionStart 重新触发——旧 injected 名单
+    若不清空，压缩后丢掉的上下文永远等不来重注入（记忆"消失"了）。"""
+    hook._remember_injected("pytest-hook", [95, 93])
+    assert hook._session_state("pytest-hook")["injected"] == [95, 93]
+
+    hook.bootstrap(_event())
+
+    assert hook._session_state("pytest-hook")["injected"] == []
+    assert not (isolated_home / "cache" / "session-pytest-hook.json").exists()
+
+
+def test_an_overlong_prompt_is_head_and_tailed_not_rejected(monkeypatch):
+    """★ A3：后端对 query 上限 4000 字符，超长直接 422 → 静默零注入。
+    头 2000 + 尾 1000 拼接后 ≈3020，既能过闸又不丢收尾的关键信息。"""
+    calls = _capture_calls(monkeypatch)
+    prompt = "头" * 2500 + "尾" * 2500
+    assert hook.recall(_event(prompt=prompt)) == 0
+
+    sent = calls[0][2]["query"]
+    assert len(sent) < 4000
+    assert sent.startswith("头" * 100)
+    assert sent.endswith("尾" * 100)
+    assert "中间过长已截断" in sent
+
+
+def test_a_normal_prompt_is_passed_through_untouched(monkeypatch):
+    calls = _capture_calls(monkeypatch)
+    assert hook.recall(_event(prompt="Tiket 改签")) == 0
+    assert calls[0][2]["query"] == "Tiket 改签"
+
+
+def _write_transcript(tmp_path, lines: list[str]) -> str:
+    p = tmp_path / "transcript.jsonl"
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return str(p)
+
+
+def test_the_last_assistant_text_is_extracted_from_the_transcript(isolated_home, monkeypatch):
+    """★ A2-①（S1）：hook 此前从不读 transcript_path——"上一轮改了什么"这条
+    上下文根本没送到服务端，连续指代（"那个 bug 修好了吗"）召回全靠运气。"""
+    calls = _capture_calls(monkeypatch)
+    transcript = _write_transcript(isolated_home, [
+        json.dumps({"type": "user", "message": {"role": "user",
+                                                "content": "帮我看下 mem-hook 的 bug"}}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "刚才定位到是 injected 状态没清空的问题"}]}}),
+    ])
+    assert hook.recall(_event(prompt="那个 bug 修好了吗", transcript_path=transcript)) == 0
+    assert calls[0][2]["prev_assistant_summary"] == "刚才定位到是 injected 状态没清空的问题"
+
+
+def test_a_missing_or_broken_transcript_degrades_to_none(isolated_home, monkeypatch):
+    """transcript 缺失/损坏不能影响召回主路径（hook 的硬约束：绝不报错）。"""
+    calls = _capture_calls(monkeypatch)
+    assert hook.recall(_event(prompt="普通问题")) == 0
+    assert calls[0][2]["prev_assistant_summary"] is None
+
+    broken = _write_transcript(isolated_home, ["{这不是 json"])
+    assert hook.recall(_event(prompt="再来一次", transcript_path=broken)) == 0
+    assert calls[1][2]["prev_assistant_summary"] is None
+
+
+def test_an_overlong_assistant_summary_is_trimmed(isolated_home):
+    transcript = _write_transcript(isolated_home, [
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "长" * 5000}]}}),
+    ])
+    assert len(hook._last_assistant_summary(transcript)) == 2000
+
+
 # ─────────────────────── bootstrap：本地快照缓存降级（§4.3.3）───────────────────────
 
 def test_bootstrap_prints_the_server_markdown_and_caches_it(isolated_home, monkeypatch):

@@ -93,6 +93,7 @@ class SummarizeStats:
     skipped: int = 0
     locked: int = 0
     parse_failed: int = 0
+    failed: int = 0        # ★ A10：分区级异常（LLM/网络等），记数后继续跑剩余分区
     calls: int = 0
     seconds: float = 0.0
     partitions: list = field(default_factory=list)
@@ -123,9 +124,18 @@ def run(*, org_key: str | None = None, project_key: str | None = None,
         # ★ force 只看显式参数，不从 section_key 推断：自动触发（§4.3，线索落库后
         #   排 job）同样带 section_key，推断会让每条线索都强制调 LLM 合成，阈值形同虚设。
         #   手动"强制汇总"由 UI 按钮显式传 force=true（"按阈值汇总"传 false）。
-        result = summarize_partition(
-            part["org_key"], part["project_key"], part["section_key"],
-            force=force, llm=llm)
+        # ★ A10：单分区炸掉（LLM 网络错、DB 抖动等）不再掀翻整轮——记数后继续
+        #   跑剩余分区。分区被炸掉时线索不消费（consume 只在 summarize_partition
+        #   的写事务里做），下轮自然会重试同一个分区。
+        try:
+            result = summarize_partition(
+                part["org_key"], part["project_key"], part["section_key"],
+                force=force, llm=llm)
+        except Exception:  # noqa: BLE001 — 分区容错是本层的职责，异常必须吞在这里
+            log.exception("分区汇总失败（跳过，下轮重试）：org=%s project=%s section=%s",
+                          part["org_key"], part["project_key"], part["section_key"])
+            stats.failed += 1
+            continue
         stats.partitions.append(result)
         action = result.get("action")
         if action == "proposed":

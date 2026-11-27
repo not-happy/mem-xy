@@ -50,6 +50,8 @@ def test_dedup_key_blocks_a_second_live_job(clean_jobs):
 
 
 def test_fail_requeues_until_the_budget_is_exhausted(clean_jobs):
+    """A8：失败后进入指数退避（next_retry_at），退避期内认领不到；
+    把 next_retry_at 拨回过去模拟时间流逝后可再认领；预算耗尽落 failed。"""
     from app.queue import jobs
 
     job_id = jobs.enqueue("route", {}, dedup_key="retry-me", max_attempts=2)
@@ -57,17 +59,69 @@ def test_fail_requeues_until_the_budget_is_exhausted(clean_jobs):
     jobs.claim()
     assert jobs.fail(job_id, "boom 1") == "pending"
 
+    # ★ A8：第一次失败 → 60s 退避，立即 claim 拿不到
+    row = clean_jobs.query_one("SELECT next_retry_at FROM jobs WHERE id=%s", (job_id,))
+    assert row["next_retry_at"] is not None
+    assert jobs.claim() is None
+
+    clean_jobs.execute("UPDATE jobs SET next_retry_at = now() - interval '1s' WHERE id=%s",
+                       (job_id,))
     jobs.claim()
     assert jobs.fail(job_id, "boom 2") == "failed"
 
-    row = clean_jobs.query_one("SELECT status, attempts, last_error FROM jobs WHERE id=%s",
-                               (job_id,))
+    row = clean_jobs.query_one(
+        "SELECT status, attempts, last_error, next_retry_at FROM jobs WHERE id=%s",
+        (job_id,))
     assert row["status"] == "failed"
     assert row["attempts"] == 2
     assert row["last_error"] == "boom 2"
+    assert row["next_retry_at"] is None, "终态不再需要退避时间"
 
     # a failed job is not reclaimed
     assert jobs.claim() is None
+
+
+def test_retry_backoff_doubles_and_is_capped_at_one_hour(clean_jobs):
+    """A8：60s×2^n 封顶 1h——60 → 120 → 240（jobs.max_attempts=5 时最多 4 次重试）。"""
+    from datetime import timedelta
+
+    from app.queue import jobs
+
+    job_id = jobs.enqueue("route", {}, dedup_key="backoff", max_attempts=5)
+
+    delays = []
+    for expected in (60, 120, 240):
+        clean_jobs.execute("UPDATE jobs SET next_retry_at = now() - interval '1s' WHERE id=%s",
+                           (job_id,))
+        jobs.claim()
+        before = clean_jobs.query_one("SELECT now() n")["n"]
+        assert jobs.fail(job_id, f"boom {expected}") == "pending"
+        row = clean_jobs.query_one(
+            "SELECT next_retry_at FROM jobs WHERE id=%s", (job_id,))
+        delta = row["next_retry_at"] - before
+        delays.append(delta)
+        lo = timedelta(seconds=expected - 5)
+        hi = timedelta(seconds=expected + 5)
+        assert lo <= delta <= hi, f"attempt {expected}s: got {delta}"
+
+    assert jobs.stats().get("pending", 0) == 1
+
+
+def test_job_in_backoff_is_not_claimable(clean_jobs):
+    """A8：退避期内的 pending job 必须被认领 SQL 挡住（否则退避形同虚设）。"""
+    from app.queue import jobs
+
+    job_id = jobs.enqueue("route", {}, dedup_key="cooling")
+    jobs.claim()
+    jobs.fail(job_id, "boom")
+
+    assert jobs.claim() is None, "退避期内不应认领"
+    clean_jobs.execute("UPDATE jobs SET next_retry_at = now() - interval '1s' WHERE id=%s",
+                       (job_id,))
+    reclaimed = jobs.claim()
+    assert reclaimed is not None and reclaimed["id"] == job_id
+    row = clean_jobs.query_one("SELECT next_retry_at FROM jobs WHERE id=%s", (job_id,))
+    assert row["next_retry_at"] is None, "认领时清空退避时间"
 
 
 def test_expired_lease_is_reclaimed_by_another_worker(clean_jobs):

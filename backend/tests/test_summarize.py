@@ -271,3 +271,24 @@ def test_candidate_sections_counts_only_unconsumed_positive(db):
     seed_obs(db, f"{MARK}否决", polarity="negative")
     rows = summ.candidate_sections(org_key=ORG, project_key=PROJECT, section_key=SECTION)
     assert len(rows) == 1 and rows[0]["n"] == 2
+
+
+# ─────────────────────── A10：分区容错（W4） ───────────────────────
+
+def test_one_failing_partition_does_not_kill_the_whole_run(db, monkeypatch, caplog):
+    """★ A10-①（W4）：多分区扫描时，一个分区炸（LLM 网络错 / DB 抖动）不许掀翻
+    整轮——剩余分区照常处理，炸掉的分区线索不消费、下轮自然重试。"""
+    import logging
+
+    def boom(*a, **k):
+        raise RuntimeError("gateway 502")
+
+    seed_obs(db, f"{MARK}会被炸掉的线索")
+    monkeypatch.setattr(summ, "summarize_partition", boom)
+    stats = summ.run(org_key=ORG, project_key=PROJECT, section_key=SECTION)
+    assert stats.failed == 1
+    assert stats.partitions == []              # 没有产出，也没有掀翻
+    # 线索未消费，下轮还能再扫到
+    assert len(summ.candidate_sections(org_key=ORG, project_key=PROJECT,
+                                       section_key=SECTION)) == 1
+    assert any(r.levelno == logging.ERROR for r in caplog.records)

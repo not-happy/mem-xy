@@ -49,8 +49,24 @@ def _handle_route(job: dict, conn) -> None:
 
 def _handle_write_facts(job: dict, conn) -> None:
     from .pipeline import facts
+    from .queue import jobs
 
-    facts.write_facts(job["payload"])   # 同样自管连接，理由见 _handle_route
+    payload = job["payload"]
+    job_id = job.get("id")
+    # ★ A7：write_facts 的 LLM 判重是全流程最慢的 job（每个"桶×块"一次 LLM 调用，
+    #   慢时几十秒一块），route 那种窗口级续租盖不住这里——租约一过期，第二个 worker
+    #   就会认领重跑（事件双写、计数双加）。每个判重块开始前续一次租约 +
+    #   把 {bucket, buckets_total} 写进 progress；幂等由 UNIQUE(source_msg, content_hash)
+    #   和 memory_events 唯一索引兜底（即便真被抢，重放也不产生第二行）。
+    def on_bucket(idx: int, total: int) -> None:
+        if not job_id:
+            return
+        jobs.renew_lease(job_id, started_at=job.get("started_at"))
+        jobs.set_progress(job_id, {"bucket": idx, "buckets_total": total})
+
+    stats = facts.write_facts(payload, on_bucket=on_bucket if job_id else None)
+    if stats is not None:
+        log.info("write_facts job %s: %s", job_id, stats.as_dict())
 
 
 def _handle_apply_decision(job: dict, conn) -> None:
@@ -96,6 +112,51 @@ def _handle_scan(job: dict, conn) -> None:
     log.info("scan job %s: %s", job.get("id"), result)
 
 
+def _handle_cleanup(job: dict, conn) -> None:
+    """★ A9：保留期清理（app/cleanup.py 模块注释讲全口径）。自管事务。"""
+    from . import cleanup as cleanup_mod
+
+    with db.transaction() as tx:
+        deleted = cleanup_mod.cleanup(tx)
+    log.info("cleanup job %s: %s", job.get("id"), deleted)
+
+
+def _handle_dedup_scan(job: dict, conn) -> None:
+    """★ B4-②：近重复合并扫描（app/dedup_scan.py 模块注释讲全口径）。自管事务。"""
+    from . import dedup_scan as dedup_mod
+
+    with db.transaction() as tx:
+        result = dedup_mod.scan(tx)
+    log.info("dedup_scan job %s: %s", job.get("id"), result)
+
+
+def maybe_enqueue_cleanup() -> None:
+    """★ A9：worker 起来时看一眼要不要补当日 cleanup job（24h 节流 + 当日去重）。"""
+    from . import cleanup as cleanup_mod
+    from .queue import jobs
+
+    try:
+        with db.transaction() as tx:
+            job_id = cleanup_mod.maybe_enqueue_daily(tx)
+        if job_id:
+            log.info("enqueued daily cleanup job %s", job_id)
+    except Exception:  # noqa: BLE001 — 调度失败不该影响 worker 起来干活
+        log.exception("maybe_enqueue_cleanup failed")
+
+
+def maybe_enqueue_dedup_scan() -> None:
+    """★ B4-②：worker 起来时看一眼要不要补当日近重复合并扫描（同 cleanup 口径）。"""
+    from . import dedup_scan as dedup_mod
+
+    try:
+        with db.transaction() as tx:
+            job_id = dedup_mod.maybe_enqueue_daily(tx)
+        if job_id:
+            log.info("enqueued daily dedup_scan job %s", job_id)
+    except Exception:  # noqa: BLE001 — 调度失败不该影响 worker 起来干活
+        log.exception("maybe_enqueue_dedup_scan failed")
+
+
 HANDLERS: dict = {
     "route": _handle_route,
     "write_facts": _handle_write_facts,
@@ -103,6 +164,8 @@ HANDLERS: dict = {
     "summarize": _handle_summarize,
     "apply_proposal": _handle_apply_proposal,
     "scan": _handle_scan,
+    "cleanup": _handle_cleanup,
+    "dedup_scan": _handle_dedup_scan,
 }
 
 _stop = threading.Event()
@@ -124,6 +187,8 @@ def main() -> None:
         if hasattr(signal, sig):
             signal.signal(getattr(signal, sig), lambda *_: _stop.set())
 
+    maybe_enqueue_cleanup()
+    maybe_enqueue_dedup_scan()
     log.info("worker starting; %d handler(s) registered", len(HANDLERS))
     run_worker(HANDLERS, should_stop=_stop.is_set)
     db.close_pool()

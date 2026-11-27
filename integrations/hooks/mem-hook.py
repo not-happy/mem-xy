@@ -141,7 +141,24 @@ def _reset_breaker() -> None:
 
 # ─────────────────────────── SessionStart ───────────────────────────
 
+def _reset_session_state(session_id: str) -> None:
+    """★ A1（S2）：会话重新开始时清掉上一次的注入状态。
+
+    Claude Code 在 /compact 或 resume 后会重新触发 SessionStart——压缩后上下文
+    已经没了，此前记下的"已注入"名单会让 recall 把这些记忆继续排除掉，
+    结果是压缩后的会话**再也收不到任何已注入过的记忆**（S2 的静默失效）。
+    新会话从空白状态开始，正常轮次仍由 exclude_ids 防重复注入，行为不变。
+    """
+    try:
+        (_cache_dir() / f"session-{session_id}.json").unlink()
+    except Exception:  # noqa: BLE001 — 文件不存在/删不掉都当"已经干净"
+        pass
+
+
 def bootstrap(event: dict) -> int:
+    session_id = event.get("session_id") or "anonymous"
+    # ★ A1：压缩/恢复后的新会话开始，先清上一轮的注入名单（见 _reset_session_state）。
+    _reset_session_state(session_id)
     status, payload = _call("GET", "/v1/context/bootstrap?" + _query({
         "cwd": event.get("cwd"),
     }))
@@ -204,6 +221,66 @@ def _read_cache(cache_key: str | None) -> str:
 
 # ─────────────────────────── UserPromptSubmit ───────────────────────────
 
+def _clamp_prompt(prompt: str) -> str:
+    """★ A3（S7 前置）：超长 prompt 取头 2000 + 尾 1000 再请求。
+
+    后端 RecallRequest 对 query 的上限是 4000 字符（api/read.py），超了直接
+    422——而 hook 的约定是"失败 = 静默零注入"，用户只会看到"这轮没有记忆"，
+    根本想不到是 prompt 太长。头尾保留是经验：记忆匹配的锚点通常在开头的
+    主题陈述和结尾的最新指令里，中间的粘贴正文贡献最小。
+    """
+    if len(prompt) <= 4000:
+        return prompt
+    return prompt[:2000] + "\n…（中间过长已截断）…\n" + prompt[-1000:]
+
+
+def _last_assistant_summary(transcript_path: str | None) -> str | None:
+    """★ A2-①（S1/H2）：从 transcript JSONL 尾部提取最后一条 assistant 文本。
+
+    hook 的 stdin 里带 transcript_path，但此前从没读过——查询增广在服务端
+    是死代码。这里只读文件**尾部 64KB**（大 transcript 不能整读，读盘+解析
+    要抢 400ms 预算），从后往前找第一条带正文文本的 assistant 消息，
+    截 2000 字符（后端 RecallRequest 的上限）。任何异常都返回 None，
+    降级成"没有摘要"，不影响主流程。
+    """
+    if not transcript_path:
+        return None
+    try:
+        with open(transcript_path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 64 * 1024))
+            raw = fh.read()
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        for line in reversed(lines):          # 尾部向前；首行可能残缺，坏了就跳过
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            message = entry.get("message") or {}
+            is_assistant = (entry.get("type") == "assistant"
+                            or message.get("role") == "assistant")
+            if not is_assistant:
+                continue
+            content = message.get("content")
+            texts = []
+            if isinstance(content, str):
+                texts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        texts.append(block.get("text") or "")
+            text = "\n".join(t for t in texts if t).strip()
+            if text:
+                return text[:2000]
+    except Exception:  # noqa: BLE001 — 读不到就当没有
+        return None
+    return None
+
+
 def recall(event: dict) -> int:
     prompt = (event.get("prompt") or "").strip()
     if not prompt:
@@ -211,10 +288,13 @@ def recall(event: dict) -> int:
     session_id = event.get("session_id") or "anonymous"
 
     status, payload = _call("POST", "/v1/recall", {
-        "query": prompt,
+        "query": _clamp_prompt(prompt),
         "session_id": session_id,
         "cwd": event.get("cwd"),
         "source": "hook",
+        # ★ A2-①：把上一条 assistant 回复的摘要交给服务端做查询增广
+        #   （服务端再截 2000；recall 侧分段编码，见 retrieve/recall.py A2 注释）。
+        "prev_assistant_summary": _last_assistant_summary(event.get("transcript_path")),
         # ★ 排除本 session 已注入过的：同一条记忆每轮都塞一遍，
         #   600 token 的预算（§1.2）几轮就烧光了，而且模型会开始忽略它。
         "exclude_ids": _session_state(session_id).get("injected", []),

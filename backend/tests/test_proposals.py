@@ -200,6 +200,40 @@ def test_replaying_an_accepted_job_does_not_double_bump(db):
     assert len(history(db, doc["id"])) == 1        # 没有叠第二条 history
 
 
+def test_the_partial_unique_index_is_the_last_line_of_defense(db):
+    """★ A10-③（W5）：预查 + FOR UPDATE 之间仍有理论竞态窗口，真正的兜底是
+    0007 的部分唯一索引——同 proposal_id 第二条 history 插不进去，ON CONFLICT
+    返回空行，调用方据此返回 already_applied。直接验证索引语义。"""
+    pid = seed_proposal(db)
+    doc_id = seed_doc(db, f"{MARK}旧草稿")
+    from app.core import db as _db
+
+    with _db.transaction() as tx:
+        first = tx.execute(
+            "INSERT INTO living_doc_history (living_doc_id, version, new_content,"
+            "                               new_authority, proposal_id, changed_by)"
+            " VALUES (%s,1,%s,'confirmed',%s,'summarizer') RETURNING id",
+            (doc_id, f"{MARK}并发先到者", pid)).fetchone()
+        assert first is not None
+        # 并发后到者：同 proposal_id 的第二条 history 必须 ON CONFLICT 吞掉。
+        second = tx.execute(
+            "INSERT INTO living_doc_history (living_doc_id, version, new_content,"
+            "                               new_authority, proposal_id, changed_by)"
+            " VALUES (%s,2,%s,'confirmed',%s,'summarizer')"
+            " ON CONFLICT (proposal_id) WHERE proposal_id IS NOT NULL DO NOTHING"
+            " RETURNING id",
+            (doc_id, f"{MARK}并发后到者", pid)).fetchone()
+        assert second is None
+    # 而 proposal_id 为 NULL 的历史行不受部分索引约束（人工事件照常追加）。
+    with _db.transaction() as tx:
+        manual = tx.execute(
+            "INSERT INTO living_doc_history (living_doc_id, version, new_content,"
+            "                               new_authority, proposal_id, changed_by)"
+            " VALUES (%s,3,%s,'confirmed',NULL,'human') RETURNING id",
+            (doc_id, f"{MARK}人工补记")).fetchone()
+        assert manual is not None
+
+
 # ── 否决：写否决记录 ───────────────────────────────────────────────────────
 
 def test_rejecting_writes_a_negative_observation(db):

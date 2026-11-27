@@ -25,11 +25,13 @@ CLAIM_SQL = """
 UPDATE jobs SET status='running',
                 lease_until = now() + make_interval(secs => %(lease)s),
                 attempts = attempts + 1,
-                started_at = now()
+                started_at = now(),
+                next_retry_at = NULL
  WHERE id = (
     SELECT id FROM jobs
-     WHERE status='pending'
-        OR (status='running' AND lease_until < now())   -- zombie lease reclaim
+     WHERE (status='pending'
+            OR (status='running' AND lease_until < now()))  -- zombie lease reclaim
+       AND (next_retry_at IS NULL OR next_retry_at <= now()) -- A8 指数退避：未到点不认领
      ORDER BY id
      FOR UPDATE SKIP LOCKED
      LIMIT 1
@@ -127,17 +129,24 @@ def fail(job_id: int, error: str, started_at=None) -> str:
             UPDATE jobs
                SET last_error = %(err)s,
                    lease_until = NULL,
+                   next_retry_at = CASE
+                       -- A8 指数退避：60s×2^(attempts-1)，封顶 1h。attempts 在 claim
+                       -- 时已 +1，第一次失败 attempts=1 → 60s。耗尽预算的行不需要退避。
+                       WHEN attempts >= max_attempts THEN NULL
+                       ELSE now() + make_interval(secs => LEAST(3600, 60 * POWER(2, attempts - 1))::int)
+                   END,
                    status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
                    finished_at = CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END
              WHERE id = %(id)s{owned}
-            RETURNING status, attempts, max_attempts
+            RETURNING status, attempts, max_attempts, next_retry_at
             """,
             params,
         ).fetchone()
         conn.commit()
     if row:
-        log.warning("job %s -> %s (attempt %s/%s): %s",
-                    job_id, row["status"], row["attempts"], row["max_attempts"], message[:300])
+        log.warning("job %s -> %s (attempt %s/%s, next_retry_at=%s): %s",
+                    job_id, row["status"], row["attempts"], row["max_attempts"],
+                    row["next_retry_at"], message[:300])
         return row["status"]
     if started_at is not None and db.query_one("SELECT 1 FROM jobs WHERE id=%s", (job_id,)):
         log.warning("job %s fail skipped: 所有权已丢失（租约曾被回收？）", job_id)

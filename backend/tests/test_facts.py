@@ -220,6 +220,79 @@ def test_a_parse_failure_falls_back_to_add(db):
     assert stats.parse_failed == 1 and stats.added == 1
 
 
+# ─────────────────────── A4：候选集校验（W2 幻觉引用） ───────────────────────
+
+def test_a_hallucinated_memory_id_falls_back_to_add(db, caplog):
+    """★ A4（W2）：LLM 编造候选集之外的 memory_id 去执行 UPDATE/DELETE，
+    要么打错人要么静默丢弃素材。按 unjudged 兜底走 ADD，素材宁多不丢。"""
+    import logging
+
+    llm = FakeLLM(decision(0, "UPDATE", memory_id=999999999, merged_content="pytest-facts-被幻觉指到"))
+    stats = facts_mod.write_facts(
+        payload(fact("pytest-facts-新增事实：验价服务超时 3 秒熔断", keywords=["验价"])),
+        llm=llm)
+    assert stats.invalid_refs == 1 and stats.added == 1
+    assert stats.updated == 0
+    assert not any(r["content"] == "pytest-facts-被幻觉指到" for r in rows(db))
+    assert any("999999999" in r.message for r in caplog.records
+               if r.levelno == logging.WARNING)
+
+
+def test_an_update_pointing_at_a_missing_row_is_reported_not_silent(db, caplog):
+    """★ A4 另一半：id 在候选集里（LLM 见过）但执行时行已没了（并发删除）——
+    rowcount==0 必须留痕迹，不能当成功过。构造法：把候选记忆的 status 改成
+    deleted，dense 查询看不见它，但 keywords 通道还能捞回来进候选。"""
+    import logging
+
+    memory_id = seed_memory(db, "pytest-facts-bookingFlowService 缺婴儿票校验",
+                            keywords=["bookingFlow"])
+    db.execute("UPDATE memories SET status='deleted' WHERE id=%s", (memory_id,))
+    llm = FakeLLM(decision(0, "UPDATE", memory_id=memory_id, merged_content="pytest-facts-更新到已删行"))
+    stats = facts_mod.write_facts(
+        payload(fact("pytest-facts-bookingFlow 新增改签分支", keywords=["bookingFlow"])),
+        llm=llm)
+    assert stats.invalid_refs == 1
+    assert stats.updated == 0
+    assert any(str(memory_id) in r.message for r in caplog.records
+               if r.levelno == logging.WARNING)
+
+
+# ─────────────────────── A7：write_facts 逐桶续租回调 ───────────────────────
+
+def test_the_on_bucket_callback_fires_for_every_chunk(db):
+    """★ A7（W3）：write_facts 是最慢的 job（LLM 判重逐桶串行），route 式
+    窗口级续租盖不住它——租约过期会被第二个 worker 双执行。回调每 chunk
+    触发一次，worker 借此 renew_lease。"""
+    seen = []
+
+    def on_bucket(idx, total):
+        seen.append((idx, total))
+
+    stats = facts_mod.write_facts(
+        payload(fact("pytest-facts-续租回调测试一", keywords=["a"]),
+                fact("pytest-facts-续租回调测试二", keywords=["b"])),
+        llm=FakeLLM(decision(0, "ADD"), decision(0, "ADD")),
+        on_bucket=on_bucket)
+    # 两条 fact 同 scope/subject/role/org/project → 同一个桶，总量 <MAX_FACTS_PER_CALL
+    # → 只有一个 chunk，回调触发一次 (0, 1)。要触发多 chunk 需要 >20 条，过重。
+    assert len(seen) == 1
+    assert seen == [(0, 1)]
+    assert stats.added == 2
+
+
+def test_a_failing_on_bucket_callback_does_not_kill_the_write(db):
+    """续租是尽力而为：回调炸了只记日志，写入主流程不能跟着陪葬。"""
+
+    def broken(idx, total):
+        raise RuntimeError("lease renew raced")
+
+    stats = facts_mod.write_facts(
+        payload(fact("pytest-facts-回调炸了素材还得落库", keywords=["x"])),
+        llm=FakeLLM(decision(0, "ADD")),
+        on_bucket=broken)
+    assert stats.added == 1
+
+
 def test_scope_user_drops_org_key_so_it_stays_globally_visible(db):
     """★ §6.1 的可见性条件是 `scope='user' OR (scope='org' AND org_key=:org) OR ...`。
     user 级记忆要是带上了 org_key，换个 org 的会话就召不回来了。"""
@@ -294,6 +367,43 @@ def test_an_empty_partition_tells_the_model_to_add_everything(db):
                 project_key="dida/pytest-facts-empty-bucket"),
         llm=llm)
     assert "还没有任何记忆" in llm.prompts[0]
+
+
+def test_a_role_mismatched_twin_is_now_a_candidate_not_a_second_row(db):
+    """★ B4（S5 去重角色墙）：同一件事被 route 判成 role=preference、新事实判成 role=fact
+    （#2441/#2506 的形状）——旧口径下候选查询按 role 过滤，两条互相看不见，
+    落成两行永不合拢；放宽到 (scope, org, project) 后必须能对上（NOOP 命中旧行）。"""
+    existing = seed_memory(db, "pytest-facts-用户永远要求中文回答",
+                           scope="user", subject="user", role="preference",
+                           keywords=["中文"])
+    stats = facts_mod.write_facts(
+        payload(fact("pytest-facts-用户永远要求中文回答", scope="user", subject="user",
+                     role="fact", keywords=["中文"])),
+        llm=FakeLLM(decision(0, "NOOP", memory_id=existing)))
+    assert stats.noop == 1 and stats.added == 0
+    assert len(rows(db)) == 1
+
+
+def test_a_cross_subject_candidate_still_ranks_behind_the_same_tag_one(db):
+    """★ B4：subject/role 降级为加分项——跨标签候选进得来（上面的用例），
+    但同标签的候选在平分时要排前面（加分只影响边界排序，不影响进不进得来）。"""
+    same_tag = seed_memory(db, "pytest-facts-gds-agg 禁止引入 Lombok",
+                           subject="project", role="fact", keywords=["Lombok"])
+    cross_tag = seed_memory(db, "pytest-facts-gds-agg 禁止引入 Lombok 补充说明",
+                            subject="user", role="preference", keywords=["Lombok"])
+    stats = facts_mod.write_facts(
+        payload(fact("pytest-facts-gds-agg 禁止引入 Lombok", keywords=["Lombok"])),
+        llm=FakeLLM(decision(0, "NOOP", memory_id=same_tag)))
+    # 候选顺序里同标签的排前面（tag_match 加分），且两者都进了候选。
+    probe = facts_mod._facts_from(payload(
+        fact("pytest-facts-gds-agg 禁止引入 Lombok", keywords=["Lombok"])))[0]
+    probe.embedding = facts_mod.get_embedding_service().encode_one(probe.content)
+    with facts_mod.db.transaction() as tx:
+        facts_mod.db.enable_iterative_scan(tx)
+        probe.candidates = facts_mod._candidates(tx, probe)
+    ids = [c["id"] for c in probe.candidates]
+    assert same_tag in ids and cross_tag in ids
+    assert ids.index(same_tag) < ids.index(cross_tag)
 
 
 def test_the_iterative_scan_setting_is_accepted_by_this_pgvector(db):

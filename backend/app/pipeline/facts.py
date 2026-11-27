@@ -33,7 +33,9 @@ MAX_FACTS_PER_CALL = 20       # 一桶太大就再切，prompt 长度要有上�
 MAX_BUCKET_CANDIDATES = 20    # 一桶里所有新事实的候选取并集后的上界
 
 _DENSE_SQL = """
-SELECT id, content, keywords, mention_count, revision_count
+SELECT id, content, keywords, mention_count, revision_count,
+       (CASE WHEN subject = %(subject)s THEN 1 ELSE 0 END
+      + CASE WHEN role = %(role)s THEN 1 ELSE 0 END) AS tag_match
   FROM memories
  WHERE status = 'active' AND embedding IS NOT NULL AND {bucket}
  ORDER BY embedding <=> %(vec)s::vector
@@ -42,16 +44,25 @@ SELECT id, content, keywords, mention_count, revision_count
 
 _KEYWORD_SQL = """
 SELECT id, content, keywords, mention_count, revision_count,
-       (SELECT count(*) FROM unnest(keywords) w WHERE w = ANY(%(kw)s)) AS overlap
+       (SELECT count(*) FROM unnest(keywords) w WHERE w = ANY(%(kw)s)) AS overlap,
+       (CASE WHEN subject = %(subject)s THEN 1 ELSE 0 END
+      + CASE WHEN role = %(role)s THEN 1 ELSE 0 END) AS tag_match
   FROM memories
  WHERE status = 'active' AND keywords && %(kw)s AND {bucket}
  ORDER BY overlap DESC, id
  LIMIT %(limit)s
 """
 
-_BUCKET_WHERE = ("scope = %(scope)s AND subject = %(subject)s AND role = %(role)s"
+# ★ B4（S5 去重角色墙）：候选查询放宽到同 (scope, org, project)——subject/role 不再是
+#   过滤条件，降级为排序加分项（tag_match）。旧口径下 route 把 role 判错一格
+#   （如 preference vs fact），同一件事就会落成两条互相看不见的行（#2441/#2506）。
+#   加分只影响边界截断（20 名切口与 top5 喂给 LLM 的顺序），不让同标签的
+#   不相关候选翻过语义更近的候选：数值 ≈ 单通道相邻两名 RRF 分差的 1/2。
+_BUCKET_WHERE = ("scope = %(scope)s"
                  " AND org_key IS NOT DISTINCT FROM %(org)s"
                  " AND project_key IS NOT DISTINCT FROM %(project)s")
+
+TAG_BONUS = 0.002
 
 
 @dataclass(frozen=True)
@@ -95,6 +106,7 @@ class WriteStats:
     noop: int = 0
     dup_blocked: int = 0   # 被 UNIQUE(source_msg, content_hash) 挡掉 = 重放，正是它该干的活
     unjudged: int = 0      # LLM 漏判的 → 一律 ADD（宁可多一条重复，也不能丢素材）
+    invalid_refs: int = 0  # ★ A4：LLM 引用了候选集之外的 memory_id（幻觉）→ 不执行，ADD 兜底
     parse_failed: int = 0
     seconds: float = 0.0
 
@@ -161,10 +173,17 @@ def _candidates(conn: Connection, fact: Fact) -> list[dict]:
     by_id = {row["id"]: dict(row) for row in list(dense) + list(keyed)}
     fused = _rrf([[r["id"] for r in dense], [r["id"] for r in keyed]],
                  get_settings().recall_rrf_k)
+    # ★ B4：subject/role 是加分项不是过滤条件——同分近邻里同标签的排前面，
+    #   但语义距离仍是第一排序键（RRF）。
+    boosted = sorted(
+        fused,
+        key=lambda pair: pair[1] + by_id[pair[0]].get("tag_match", 0) * TAG_BONUS,
+        reverse=True,
+    )
     out = []
-    for memory_id, score in fused[:MAX_BUCKET_CANDIDATES]:
+    for memory_id, score in boosted[:MAX_BUCKET_CANDIDATES]:
         row = by_id[memory_id]
-        row["rrf"] = score
+        row["rrf"] = score  # 原始 RRF（不含加分），留作观测；rerank 截断沿用 boosted 顺序
         out.append(row)
     return out
 
@@ -196,7 +215,8 @@ def _prompt_user_message(facts: list[Fact]) -> str:
     else:
         old_lines = ["（这个分区里还没有任何记忆，全部按 ADD 处理）"]
     return ("【新事实】\n" + "\n".join(new_lines) +
-            "\n\n【已有记忆】（同一分区，按相关度排序）\n" + "\n".join(old_lines))
+            "\n\n【已有记忆】（同分区近邻，subject/role 可能与新事实不同，按相关度排序）\n"
+            + "\n".join(old_lines))
 
 
 def _judge(facts: list[Fact], llm) -> dict[int, object]:
@@ -211,9 +231,13 @@ def _judge(facts: list[Fact], llm) -> dict[int, object]:
     return {d.index: d for d in result.decisions if 0 <= d.index < len(facts)}
 
 
-def write_facts(payload: dict, *, llm=None) -> WriteStats:
+def write_facts(payload: dict, *, llm=None, on_bucket=None) -> WriteStats:
     """★ 自己管连接：读候选一个短事务，写入另一个短事务，LLM 调用夹在两者之间。
-    不接受外部 `conn`——把 LLM 关在调用方的事务里正是 §5.5 明确禁止的。"""
+    不接受外部 `conn`——把 LLM 关在调用方的事务里正是 §5.5 明确禁止的。
+
+    A7：`on_bucket(idx, total)` 在每个 LLM 判重块**开始前**回调——worker 借它续租。
+    write_facts 的单次调用是全流程最慢的 job（每块一次 LLM 判重，慢时几十秒/块），
+    route 那种窗口级续租盖不住这里，租约过期被第二个 worker 认领就是双执行。"""
     stats = WriteStats()
     facts = _facts_from(payload)
     stats.items = len(facts)
@@ -236,23 +260,33 @@ def write_facts(payload: dict, *, llm=None) -> WriteStats:
         buckets[fact.bucket].append(fact)
     stats.buckets = len(buckets)
 
+    # 先摊平"桶×块"计划，回调才拿得到全局序号（worker 的 set_progress 需要总数）。
+    chunks: list[tuple[Bucket, list[Fact]]] = [
+        (bucket, group[start:start + MAX_FACTS_PER_CALL])
+        for bucket, group in buckets.items()
+        for start in range(0, len(group), MAX_FACTS_PER_CALL)
+    ]
+
     decisions: dict[int, object] = {}
-    for bucket, group in buckets.items():
-        for start in range(0, len(group), MAX_FACTS_PER_CALL):
-            chunk = group[start:start + MAX_FACTS_PER_CALL]
-            started = time.perf_counter()
+    for chunk_idx, (bucket, chunk) in enumerate(chunks):
+        if on_bucket is not None:
             try:
-                judged = _judge(chunk, client)
-            except LLMParseError as exc:
-                # 判不出就整桶 ADD：多几条重复记忆下次还能合并，丢掉素材捡不回来。
-                stats.parse_failed += 1
-                log.error("桶 %s 的输出不合 schema，整桶按 ADD 落库：%s", bucket, exc)
-                judged = {}
-            stats.calls += 1
-            stats.seconds += time.perf_counter() - started
-            for position, fact in enumerate(chunk):
-                if position in judged:
-                    decisions[fact.index] = judged[position]
+                on_bucket(chunk_idx, len(chunks))
+            except Exception:  # 回调只管续租，别让它炸掉写入主流程
+                log.exception("on_bucket 回调失败（忽略，续租由下一次机会兜底）")
+        started = time.perf_counter()
+        try:
+            judged = _judge(chunk, client)
+        except LLMParseError as exc:
+            # 判不出就整桶 ADD：多几条重复记忆下次还能合并，丢掉素材捡不回来。
+            stats.parse_failed += 1
+            log.error("桶 %s 的输出不合 schema，整桶按 ADD 落库：%s", bucket, exc)
+            judged = {}
+        stats.calls += 1
+        stats.seconds += time.perf_counter() - started
+        for position, fact in enumerate(chunk):
+            if position in judged:
+                decisions[fact.index] = judged[position]
 
     merged = _embed_merged(decisions, facts, service)
     with db.transaction() as tx:
@@ -283,18 +317,32 @@ def _apply_all(conn: Connection, facts: list[Fact], decisions: dict,
             _add(conn, fact, fact.content, fact.embedding, prompt_ver, stats)
             continue
         action = decision.action
+        # ★ A4（W2）：LLM 见过的候选只有 rerank() 的 top5。它引用之外的 memory_id
+        #   一律视为幻觉引用——不执行 UPDATE/DELETE/NOOP（幻觉 id 可跨分区软删任何记忆），
+        #   改按 ADD 兜底保素材，并打点计数（B 阶段观察幻觉率）。
+        if action in ("NOOP", "UPDATE", "DELETE"):
+            valid_ids = {row["id"] for row in rerank(fact)}
+            if decision.memory_id not in valid_ids:
+                stats.invalid_refs += 1
+                log.warning("LLM 引用了候选集之外的记忆 id=%s（幻觉引用），按 ADD 兜底：%s",
+                            decision.memory_id, fact.content[:120])
+                _add(conn, fact, fact.content, fact.embedding, prompt_ver, stats)
+                continue
         if action == "NOOP":
             stats.noop += 1
-            conn.execute(
+            touched = conn.execute(
                 "UPDATE memories SET mention_count = mention_count + %s, last_seen_at = now()"
                 " WHERE id = %s AND status = 'active'",
                 (decision.mention_delta, decision.memory_id))
+            if touched.rowcount == 0:
+                # ★ A4：目标在判定到执行之间已被删（软删/硬删）——NOOP 无处落，只打点。
+                log.warning("NOOP 目标 id=%s 不存在或非 active，跳过（memory_id 引用已失效）",
+                            decision.memory_id)
             _event(conn, decision.memory_id, "NOOP", None, None, fact.source_msg)
         elif action == "UPDATE":
             old = conn.execute("SELECT content FROM memories WHERE id=%s",
                                (decision.memory_id,)).fetchone()
-            stats.updated += 1
-            conn.execute(
+            updated = conn.execute(
                 "UPDATE memories SET content=%s, content_hash=%s, embedding=%s, keywords=%s,"
                 "                    why=coalesce(%s, why), revision_count=revision_count+1,"
                 "                    updated_at=now(), last_seen_at=now(), prompt_ver=%s"
@@ -302,6 +350,12 @@ def _apply_all(conn: Connection, facts: list[Fact], decisions: dict,
                 (decision.merged_content, content_hash(decision.merged_content),
                  merged.get(fact.index), fact.keywords, fact.why, prompt_ver,
                  decision.memory_id))
+            if updated.rowcount == 0:
+                log.warning("UPDATE 目标 id=%s 不存在，跳过（memory_id 引用已失效）",
+                            decision.memory_id)
+                stats.invalid_refs += 1
+                continue
+            stats.updated += 1
             _event(conn, decision.memory_id, "UPDATE",
                    old["content"] if old else None, decision.merged_content, fact.source_msg)
         elif action == "DELETE":
@@ -309,9 +363,17 @@ def _apply_all(conn: Connection, facts: list[Fact], decisions: dict,
             # 这样"曾经以为 X，后来发现是 Y"这条轨迹是可追溯的。
             old = conn.execute("SELECT content FROM memories WHERE id=%s",
                                (decision.memory_id,)).fetchone()
+            deleted = conn.execute(
+                "UPDATE memories SET status='deleted', updated_at=now()"
+                " WHERE id=%s AND status='active'",
+                (decision.memory_id,))
+            if deleted.rowcount == 0:
+                log.warning("DELETE 目标 id=%s 不存在或已删除，跳过（memory_id 引用已失效）",
+                            decision.memory_id)
+                stats.invalid_refs += 1
+                _add(conn, fact, fact.content, fact.embedding, prompt_ver, stats)
+                continue
             stats.deleted += 1
-            conn.execute("UPDATE memories SET status='deleted', updated_at=now() WHERE id=%s",
-                         (decision.memory_id,))
             _event(conn, decision.memory_id, "DELETE",
                    old["content"] if old else None, fact.content, fact.source_msg)
             _add(conn, fact, fact.content, fact.embedding, prompt_ver, stats)
@@ -343,8 +405,10 @@ def _add(conn: Connection, fact: Fact, content: str, embedding: list[float],
 
 def _event(conn: Connection, memory_id: int, action: str, old: str | None, new: str | None,
            source_msg: int) -> None:
+    # A7：job 重试/租约过期重放时，同 (memory_id, action, source_msg) 的事件只留一条。
     conn.execute(
         "INSERT INTO memory_events (memory_id, action, old_content, new_content, source_msg)"
-        " VALUES (%s,%s,%s,%s,%s)",
+        " VALUES (%s,%s,%s,%s,%s)"
+        " ON CONFLICT (memory_id, action, source_msg) DO NOTHING",
         (memory_id, action, old, new, source_msg),
     )

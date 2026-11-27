@@ -55,12 +55,18 @@ def db():
 
 
 def _cleanup(_db):
+    _db.execute("DELETE FROM raw_observations WHERE source_msg IN"
+                " (SELECT id FROM conversation_log WHERE session_id LIKE 'pytest-route-%')")
+    _db.execute("DELETE FROM jobs WHERE kind='apply_decision' AND payload->>'pending_id' IN"
+                " (SELECT id::text FROM pending_items WHERE source_msg IN"
+                "  (SELECT id FROM conversation_log WHERE session_id LIKE 'pytest-route-%'))")
     _db.execute("DELETE FROM pending_items WHERE source_msg IN"
                 " (SELECT id FROM conversation_log WHERE session_id LIKE 'pytest-route-%')")
     _db.execute("DELETE FROM route_decisions WHERE source_msg IN"
                 " (SELECT id FROM conversation_log WHERE session_id LIKE 'pytest-route-%')")
     _db.execute("DELETE FROM jobs WHERE dedup_key LIKE %s", ("write_facts:%:pytest-route-%",))
     _db.execute("DELETE FROM extraction_cursor WHERE session_id LIKE 'pytest-route-%'")
+    _db.execute("DELETE FROM route_checkpoints WHERE session_id LIKE 'pytest-route-%'")
     _db.execute("DELETE FROM conversation_log WHERE session_id LIKE 'pytest-route-%'")
 
 
@@ -275,12 +281,16 @@ def test_a_parse_failure_lands_in_pending_and_never_drops_the_material(db, sessi
 
 def test_limit_stops_early_and_leaves_the_cursor_at_the_last_finished_window(db, session,
                                                                             matched):
+    """★ A6（W1）：游标推进到**窗口最后一行**（rows[-1].id），而不是窗口锚点。
+    超预算桶被切块后多个窗口共享同一个 anchor_id——若按锚点推进，
+    尾桶游标永远不动，`_sessions_with_new_material` 会把该会话无限重排（W1 卡死）。"""
     llm = FakeLLM({"items": []})
     with db.transaction() as conn:
         router.route_session(SESSION, conn=conn, llm=llm, limit=1)
     assert llm.call_count == 1
+    # window1 = rows 1-2（锚点 row1），处理完推进到 row2
     assert db.query_one("SELECT last_log_id FROM extraction_cursor WHERE session_id=%s",
-                        (SESSION,))["last_log_id"] == session[0]["id"]
+                        (SESSION,))["last_log_id"] == session[1]["id"]
 
 
 def test_a_summary_row_is_not_routed(db, session, matched):
@@ -294,6 +304,74 @@ def test_a_summary_row_is_not_routed(db, session, matched):
     assert stats.windows_skipped == 1
     assert stats.windows == 1        # 只剩第二个窗口
     assert llm.call_count == 1
+
+
+def test_an_over_budget_bucket_splits_windows_and_still_advances_the_cursor(db, session,
+                                                                            matched,
+                                                                            monkeypatch):
+    """★ A6（W1）核心场景：锚点桶超过 TOKEN_BUDGET 被切成多个窗口（共享 anchor），
+    游标必须推进到**最后一个窗口的末行**；重跑不得再出现任何待判窗口
+    （旧行为 done_through=anchor → 游标卡死 → 会话被无限重排）。"""
+    monkeypatch.setattr(router, "TOKEN_BUDGET", 5)   # 足够小：每行都装不进同一个窗口
+    llm = FakeLLM({"items": []}, {"items": []}, {"items": []})
+    with db.transaction() as conn:
+        stats = router.route_session(SESSION, conn=conn, llm=llm)
+    assert stats.windows >= 2, "超预算桶必须真的被切开（否则测了个寂寞）"
+    assert db.query_one("SELECT last_log_id FROM extraction_cursor WHERE session_id=%s",
+                        (SESSION,))["last_log_id"] == session[-1]["id"]
+
+    # 重跑：游标之后没有任何窗口，不再无限重排
+    again = FakeLLM()
+    with db.transaction() as conn:
+        rerun = router.route_session(SESSION, conn=conn, llm=again)
+    assert rerun.windows == 0 and again.call_count == 0
+
+
+def test_an_llm_error_midway_resumes_from_checkpoints_without_redoing_windows(db, session,
+                                                                              matched):
+    """★ A5（S4）：自管路径（生产路径）逐窗 checkpoint。第一窗成功后第二窗
+    LLMError 中断——重试时第一窗直接从 checkpoint 恢复，不再重付 LLM 调用；
+    最终游标推进、checkpoints 清理干净、decisions/pending 不重复。"""
+    from app.core.llm import LLMError
+
+    payload_w1 = {"items": [item("observation", "在 gds-agg 项目中禁止引入 Lombok")]}
+
+    class FailOnSecond:
+        """窗1 正常返回，窗2 起传输错误——模拟"跑到一半网关挂了"。"""
+
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def structured(self, task, *, system, messages, tool, schema, max_tokens=0):
+            self.calls.append(messages[0]["content"])
+            if len(self.calls) == 1:
+                return route_prompt.RouteResult.model_validate(payload_w1)
+            raise LLMError("gateway 500")
+
+        @property
+        def call_count(self):
+            return len(self.calls)
+
+    first = FailOnSecond()
+    with pytest.raises(LLMError):
+        router.route_session(SESSION, llm=first)          # 窗1 成功落 checkpoint，窗2 炸
+    assert first.call_count == 2
+
+    saved = db.query("SELECT first_msg_id FROM route_checkpoints WHERE session_id=%s"
+                     " ORDER BY first_msg_id", (SESSION,))
+    assert [r["first_msg_id"] for r in saved] == [session[0]["id"]]
+
+    second = FakeLLM({"items": []})                        # 只需要窗2 的载荷
+    stats = router.route_session(SESSION, llm=second)
+    assert second.call_count == 1, "窗1 必须从 checkpoint 恢复，不再调 LLM"
+    assert stats.restored == 1
+    assert db.query_one("SELECT last_log_id FROM extraction_cursor WHERE session_id=%s",
+                        (SESSION,))["last_log_id"] == session[-1]["id"]
+    # 成功收尾后 checkpoint 清干净
+    assert db.query_one("SELECT count(*) c FROM route_checkpoints WHERE session_id=%s",
+                        (SESSION,))["c"] == 0
+    cards = pending(db)
+    assert len(cards) == 1 and cards[0]["reason"] == "observation_needs_review"
 
 
 def test_route_session_manages_its_own_transactions(db, session, matched):
@@ -376,3 +454,120 @@ def test_queue_all_sessions_is_idempotent_per_session(monkeypatch):
     # 第二遍：队列说"已经有活的了"（enqueue 返回 None）⇒ 一个都不再排
     monkeypatch.setattr(jobs, "enqueue", lambda *a, **k: None)
     assert router.queue_all_sessions() == {"sessions": 2, "queued": 0, "already_queued": 2}
+
+
+# ───────────────────────── B5-③ 重复白名单（auto_repeat） ─────────────────────────
+# 白名单的近邻查询和送审用的同款词袋向量（_hash_vector）就够了：生产上是 bge-m3，
+# 测试只验"近邻够了放行 / 有否决不放行 / 数量不够不放行 / 跨分区不算数"的判定逻辑。
+
+DIM = 1024
+AUTO_TEXT = "在 gds-agg 项目中，X 使用 Y"          # 6 token
+AUTO_SEEDS = ["在 gds-agg 项目中，X 使用 Y 甲",   # 各加一个 token：与 query cos≈0.926
+              "在 gds-agg 项目中，X 使用 Y 乙",
+              "在 gds-agg 项目中，X 使用 Y 丙"]
+
+
+def _hash_vector(text: str) -> list[float]:
+    import hashlib
+
+    vector = [0.0] * DIM
+    for token in text.replace("，", " ").replace("、", " ").split():
+        slot = int(hashlib.md5(token.encode()).hexdigest(), 16) % DIM
+        vector[slot] += 1.0
+    norm = sum(x * x for x in vector) ** 0.5 or 1.0
+    return [x / norm for x in vector]
+
+
+@pytest.fixture
+def fake_embed(monkeypatch):
+    """_precompute_section_embeddings 在函数内 import embedding 模块，patch 模块属性即可。"""
+    from app.core import embedding as emb_mod
+
+    class FakeEmbedder:
+        def encode_one(self, text):
+            return _hash_vector(text)
+
+    monkeypatch.setattr(emb_mod, "get_embedding_service", lambda: FakeEmbedder())
+
+
+def seed_obs(db, anchor: int, content: str, *, polarity="positive", project=PROJECT):
+    from app.core.hashing import content_hash
+
+    return db.query_one(
+        "INSERT INTO raw_observations (org_key, project_key, section_key, content,"
+        "                              content_hash, polarity, embedding, source_msg,"
+        "                              prompt_ver)"
+        " VALUES (%s,%s,'code_style',%s,%s,%s,%s,%s,'pytest')"
+        " RETURNING id", (ORG, project, content, content_hash(content), polarity,
+                          _hash_vector(content), anchor))["id"]
+
+
+def test_a_frequent_repeat_auto_passes_without_a_card_for_humans(db, session, matched,
+                                                                 fake_embed):
+    """★ B5-③：同分区同栏位的正面近邻已有 3 条 → 第 4 次出现直接落库，
+    人只看见 'approved' 的已处理卡。resolution={} 保证不加任何人的改判。"""
+    anchor = session[0]["id"]
+    for content in AUTO_SEEDS:
+        seed_obs(db, anchor, content)
+
+    llm = FakeLLM({"items": [item("observation", AUTO_TEXT, confidence=1.0)]},
+                  {"items": []})
+    with db.transaction() as conn:
+        stats = router.route_session(SESSION, conn=conn, llm=llm)
+
+    assert stats.pending == 0 and stats.auto_approved == 1
+    card = pending(db)[0]
+    assert card["status"] == "approved"
+    assert card["resolved_by"] == "auto_repeat"
+    assert card["resolution"] in ({}, None) or card["resolution"] == {}
+    assert card["reason"].endswith("+auto_repeat")
+    job = db.query_one("SELECT * FROM jobs WHERE kind='apply_decision'"
+                       " AND payload->>'pending_id'=%s", (str(card["id"]),))
+    assert job is not None and job["payload"]["resolved_by"] == "auto_repeat"
+    assert job["payload"]["resolution"] == {}
+
+
+def test_a_human_veto_nearby_blocks_the_auto_pass(db, session, matched, fake_embed):
+    """★ 近邻里有任何人工否决记录（polarity='negative'）→ 永远送人工。
+    人否决过的边界比省一次点击值钱——这是白名单唯一的绝对否决条件。"""
+    anchor = session[0]["id"]
+    for content in AUTO_SEEDS:
+        seed_obs(db, anchor, content)
+    seed_obs(db, anchor, "在 gds-agg 项目中，X 使用 Y 禁", polarity="negative")
+
+    llm = FakeLLM({"items": [item("observation", AUTO_TEXT, confidence=1.0)]},
+                  {"items": []})
+    with db.transaction() as conn:
+        stats = router.route_session(SESSION, conn=conn, llm=llm)
+
+    assert stats.auto_approved == 0 and stats.pending == 1
+    assert pending(db)[0]["status"] == "pending"
+
+
+def test_two_prior_neighbors_are_not_enough(db, session, matched, fake_embed):
+    """min_seen=3：只见过两次的东西还得人看——第 4 次起才免审，宁多审不小放。"""
+    anchor = session[0]["id"]
+    for content in AUTO_SEEDS[:2]:
+        seed_obs(db, anchor, content)
+
+    llm = FakeLLM({"items": [item("observation", AUTO_TEXT, confidence=1.0)]},
+                  {"items": []})
+    with db.transaction() as conn:
+        stats = router.route_session(SESSION, conn=conn, llm=llm)
+
+    assert stats.auto_approved == 0 and stats.pending == 1
+
+
+def test_neighbors_in_another_project_do_not_count(db, session, matched, fake_embed):
+    """白名单查询带分区谓词（org+project IS NOT DISTINCT FROM）：
+    flight-supplier 里出现过的同类内容，不能替 gds-agg 的卡片免审。"""
+    anchor = session[0]["id"]
+    for content in AUTO_SEEDS:
+        seed_obs(db, anchor, content, project="dida/flight-supplier")
+
+    llm = FakeLLM({"items": [item("observation", AUTO_TEXT, confidence=1.0)]},
+                  {"items": []})
+    with db.transaction() as conn:
+        stats = router.route_session(SESSION, conn=conn, llm=llm)
+
+    assert stats.auto_approved == 0 and stats.pending == 1

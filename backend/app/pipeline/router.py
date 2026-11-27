@@ -26,6 +26,7 @@ from ..core.config import get_settings
 from ..core.llm import LLMError, LLMParseError, get_llm_client
 from ..core.redact import redact
 from ..prompts import route as route_prompt
+from ..queue import jobs
 from . import sections as section_matcher
 from .windows import Row, Window, slice_windows
 
@@ -58,9 +59,11 @@ class RouteStats:
     sessions: int = 0
     windows: int = 0
     windows_skipped: int = 0
+    restored: int = 0
     calls: int = 0
     items: int = 0
     pending: int = 0
+    auto_approved: int = 0
     facts: int = 0
     discarded: int = 0
     section_unmatched: int = 0
@@ -71,9 +74,9 @@ class RouteStats:
     seconds: float = 0.0
     kinds: Counter = field(default_factory=Counter)
 
-    _COUNTED = ("sessions", "windows", "windows_skipped", "calls", "items", "pending",
-                "facts", "discarded", "section_unmatched", "cross_org", "parse_failed",
-                "input_tokens", "output_tokens")
+    _COUNTED = ("sessions", "windows", "windows_skipped", "restored", "calls", "items",
+                "pending", "auto_approved", "facts", "discarded", "section_unmatched",
+                "cross_org", "parse_failed", "input_tokens", "output_tokens")
 
     def merge(self, other: "RouteStats") -> None:
         for name in self._COUNTED:
@@ -131,16 +134,22 @@ def _insert_decision(conn: Connection, window: Window, item, ctx: SessionCtx) ->
 
 
 def _queue_for_review(conn: Connection, window: Window, item, ctx: SessionCtx,
-                      reason: str, stats: RouteStats, decision_id: int) -> None:
+                      reason: str, stats: RouteStats, decision_id: int,
+                      embeddings: dict[str, object] | None = None) -> None:
     """§5.4：待办卡片**预选 observation**（偏向规矩侧），一眼就能改回 atomic_fact。
 
     偏向是安全的：误判成 observation 只是多审一次，后面还有汇总 + 审 diff 两道能拦；
     误判成 atomic_fact 则一条本该每次注入的规矩被静默存成零碎事实，永远发现不了。
+
+    A10：`embeddings` 是调用方在事务外预计算的 {文本: 向量}——栏位向量匹配
+    （约 15–33s 冷启动）不再发生在写事务里，连接不再被 idle-in-transaction 占住。
+    键未命中时回退 match 内部即时编码（尽力而为的优化，不是正确性依赖）。
     """
-    stats.pending += 1
+    stats.pending += 1  # B5-③：auto_repeat 免审的走完下面分支会改成 auto_approved
     text = item.content or window.as_text()[:500]
     matched = section_matcher.match(
-        text, section_matcher.load_sections(conn, has_project=bool(ctx.project_key)))
+        text, section_matcher.load_sections(conn, has_project=bool(ctx.project_key)),
+        embedding=embeddings.get(text) if embeddings else None)
     if matched is None:
         stats.section_unmatched += 1
         reason = f"{reason}+section_unmatched"
@@ -159,6 +168,36 @@ def _queue_for_review(conn: Connection, window: Window, item, ctx: SessionCtx,
         "section_score": matched.score if matched else None,
         "section_runner_up": matched.runner_up if matched else None,
     })
+    # ★ B5-③ 重复白名单：同分区同栏位的高频重复内容不再打扰人。
+    #   观察池里已有足够多近邻正面记录（人此前反复批准过同类内容）→ 直接按
+    #   预选落库；近邻里有任何人工否决记录 → 永远送人工（人否决过的边界不自动跨）。
+    #   仅在 embeddings 字典命中时才做近邻查询——向量编码绝不进写事务（§5.5），
+    #   而 _precompute_section_embeddings 恰好为每张待审卡预计算过向量。
+    if matched is not None and embeddings.get(text) is not None and _auto_repeat_ok(
+            conn, ctx, matched.section_key, embeddings[text]):
+        stats.auto_approved += 1
+        stats.pending -= 1   # 免审：这张卡不算"送人工审"（_COUNTED 总量守恒，计数不双算）
+        row = conn.execute(
+            "INSERT INTO pending_items (org_key, project_key, stage, raw_content, source_msg,"
+            "                            suggestion, reason, prompt_ver, status, resolved_by,"
+            "                            resolved_at, dedup_hash)"
+            " VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s,'approved','auto_repeat',now(),%s)"
+            " ON CONFLICT (dedup_hash) WHERE dedup_hash IS NOT NULL DO NOTHING"
+            " RETURNING id",
+            (ctx.org_key, ctx.project_key, "route" if matched else "section",
+             text[:4000], window.anchor_id, json.dumps(suggestion, ensure_ascii=False),
+             f"{reason}+auto_repeat", route_prompt.PROMPT_VER,
+             _dedup_hash(window.anchor_id, item.kind, text)),
+        ).fetchone()
+        # RETURNING 没给 id = dedup_hash 撞了（重放），卡已存在，不重排 job。
+        # resolution={}：人没在场，不加任何改判——apply_decision 从 suggestion 补全。
+        if row is not None:
+            jobs.enqueue("apply_decision",
+                         {"pending_id": row["id"], "resolved_by": "auto_repeat",
+                          "resolution": {}},
+                         org_key=ctx.org_key, conn=conn)
+        return
+
     # ★ ON CONFLICT (dedup_hash) DO NOTHING：job 被租约回收后重复执行时，
     #   同一素材不再排出第二套卡（decisions-log #70 承认的缺口）。
     #   stats.pending 仍照加——它统计的是"路由判定送审多少次"，不是"插了几行"。
@@ -175,8 +214,34 @@ def _queue_for_review(conn: Connection, window: Window, item, ctx: SessionCtx,
     )
 
 
+def _auto_repeat_ok(conn: Connection, ctx: SessionCtx, section_key: str,
+                    query_vec) -> bool:
+    """B5-③ 重复白名单的判定：这条线索值得免审吗？
+
+    True = 观察池里同分区同栏位的**正面**近邻记录已有 `auto_repeat.min_seen` 条以上
+    （人此前反复批准过同类内容，这条是又一遍重复），且近邻里**没有**任何人工否决
+    记录——否决（polarity='negative'，§5.7 第二道审核的产品）代表"这类内容不许进"，
+    人画过的边界不自动跨。查询在调用方事务内执行（纯 SELECT，无编码）。
+    """
+    settings = get_settings()
+    radius = 1.0 - settings.auto_repeat_similarity   # 余弦相似度 → pgvector 距离
+    counts = conn.execute(
+        "SELECT count(*) FILTER (WHERE o.polarity='positive') AS pos,"
+        "       count(*) FILTER (WHERE o.polarity='negative') AS veto"
+        "  FROM raw_observations o"
+        " WHERE o.section_key = %(sec)s"
+        "   AND o.org_key IS NOT DISTINCT FROM %(org)s"
+        "   AND o.project_key IS NOT DISTINCT FROM %(proj)s"
+        "   AND o.embedding IS NOT NULL"
+        "   AND (o.embedding <=> %(vec)s::vector) <= %(radius)s",
+        {"sec": section_key, "org": ctx.org_key, "proj": ctx.project_key,
+         "vec": query_vec, "radius": radius},
+    ).fetchone()
+    return counts["pos"] >= settings.auto_repeat_min_seen and counts["veto"] == 0
+
+
 def _decide(conn: Connection, item, window: Window, ctx: SessionCtx,
-            stats: RouteStats) -> dict | None:
+            stats: RouteStats, embeddings: dict[str, object] | None = None) -> dict | None:
     """按阈值判定一条。返回要进 `write_facts` 的 payload；None 表示不进（已记日志或已进待办）。"""
     stats.kinds[item.kind] += 1
     decision_id = _insert_decision(conn, window, item, ctx)
@@ -185,7 +250,7 @@ def _decide(conn: Connection, item, window: Window, ctx: SessionCtx,
         # ★ 规矩类不设置信度阈值（#51）：confidence 在这一类上实测毫无区分度，
         #   判错也报 0.93–1.0，0.95 阈值一条也拦不住。全审是唯一能捞回来的办法。
         _queue_for_review(conn, window, item, ctx, "observation_needs_review", stats,
-                          decision_id)
+                          decision_id, embeddings=embeddings)
         return None
 
     if item.kind == "discard":
@@ -203,7 +268,7 @@ def _decide(conn: Connection, item, window: Window, ctx: SessionCtx,
     floor = get_settings().route_confidence_thresholds.get(item.kind)
     if floor is not None and item.confidence < floor:
         _queue_for_review(conn, window, item, ctx, f"below_threshold:{floor}", stats,
-                          decision_id)
+                          decision_id, embeddings=embeddings)
         return None
 
     stats.facts += 1
@@ -237,8 +302,12 @@ def route_session(session_id: str, *, source: str = "claude-code",
         prepared = _prepare(conn, session_id, source)
         if prepared is not None:
             ctx, todo = prepared
-            outcomes = _call_llm(todo, ctx, client, stats, limit=limit, on_window=on_window)
-            _write_outcomes(conn, source=source, ctx=ctx, stats=stats, outcomes=outcomes)
+            outcomes = _call_llm(todo, ctx, client, stats, source=source, limit=limit,
+                                 on_window=on_window, checkpoints=None,
+                                 persist_checkpoints=False)
+            embeddings = _precompute_section_embeddings(outcomes)
+            _write_outcomes(conn, source=source, ctx=ctx, stats=stats, outcomes=outcomes,
+                            embeddings=embeddings)
         return stats
 
     with db.connect() as reader:
@@ -246,9 +315,17 @@ def route_session(session_id: str, *, source: str = "claude-code",
         if prepared is None:
             return stats
         ctx, todo = prepared
-        outcomes = _call_llm(todo, ctx, client, stats, limit=limit, on_window=on_window)
+        # ★ A5：断点续路由。段② 之前先读 checkpoint（上一轮 LLMError 前已成功的窗口），
+        #   命中的窗口直接恢复结果不再调 LLM——重付的只是真正没跑过的窗口。
+        checkpoints = _load_checkpoints(reader, session_id, source)
+        outcomes = _call_llm(todo, ctx, client, stats, source=source, limit=limit,
+                             on_window=on_window, checkpoints=checkpoints,
+                             persist_checkpoints=True)
+        # ★ A10：栏位向量在事务外预计算——冷启动 15–33s 不再占着写事务连接。
+        embeddings = _precompute_section_embeddings(outcomes)
     with db.transaction() as tx:
-        _write_outcomes(tx, source=source, ctx=ctx, stats=stats, outcomes=outcomes)
+        _write_outcomes(tx, source=source, ctx=ctx, stats=stats, outcomes=outcomes,
+                        embeddings=embeddings)
     return stats
 
 
@@ -275,8 +352,55 @@ def _prepare(conn: Connection, session_id: str,
     parsed = [Row(id=r["id"], role=r["role"], content=r["content"],
                   turn_no=r["turn_no"], tokens_est=r["tokens_est"]) for r in rows]
     todo = [w for w in slice_windows(parsed, token_budget=TOKEN_BUDGET)
-            if w.anchor_id > last_log_id]
+            # ★ A6（W1）：过滤与游标都以窗口**末行**为准。窗口锚点（首行 id）在
+            #   token 预算切多窗时不再推进，若用它过滤，超长桶会整桶卡死——
+            #   90021 之后永远路由不到，且无任何失败痕迹。
+            if w.rows[-1].id > last_log_id]
     return ctx, todo
+
+
+_CHECKPOINT_SQL = (
+    "SELECT first_msg_id, model_output FROM route_checkpoints"
+    " WHERE source=%s AND session_id=%s AND prompt_ver=%s"
+)
+
+
+def _load_checkpoints(conn: Connection, session_id: str, source: str) -> dict[int, dict]:
+    """A5：读上一轮成功窗口的 checkpoint（anchor_id → RouteResult 兼容 dict）。
+
+    恢复失败（schema 变了之类）的行直接丢弃——回退正常调 LLM，不阻塞。
+    """
+    saved: dict[int, dict] = {}
+    for row in conn.execute(_CHECKPOINT_SQL,
+                            (source, session_id, route_prompt.PROMPT_VER)).fetchall():
+        try:
+            route_prompt.RouteResult.model_validate(row["model_output"])
+        except Exception:  # noqa: BLE001 — 坏行不值得让整会话失败
+            log.warning("checkpoint 窗口 %s 无法恢复，跳过（该窗口将重新路由）",
+                        row["first_msg_id"])
+            continue
+        saved[row["first_msg_id"]] = row["model_output"]
+    return saved
+
+
+def _save_checkpoint(window: Window, result, source: str, ctx: SessionCtx) -> None:
+    """A5：段② 每窗 LLM 成功后自开短事务落一行 checkpoint。
+
+    尽力而为：checkpoint 写失败只意味着下次重试多付一次 LLM 调用，不能反噬主路径。
+    """
+    try:
+        with db.transaction() as tx:
+            tx.execute(
+                "INSERT INTO route_checkpoints"
+                " (source, session_id, first_msg_id, prompt_ver, model_output)"
+                " VALUES (%s,%s,%s,%s,%s::jsonb)"
+                " ON CONFLICT (source, session_id, first_msg_id, prompt_ver) DO NOTHING",
+                (source, ctx.session_id, window.anchor_id, route_prompt.PROMPT_VER,
+                 json.dumps(result.model_dump(exclude_none=True), ensure_ascii=False)),
+            )
+    except Exception:  # noqa: BLE001
+        log.warning("checkpoint 保存失败（窗口 %s，不影响本次路由）", window.anchor_id,
+                    exc_info=True)
 
 
 @dataclass
@@ -294,9 +418,16 @@ class _Outcome:
 
 
 def _call_llm(todo: list[Window], ctx: SessionCtx, client, stats: RouteStats, *,
-              limit: int | None,
-              on_window: Callable[[int, int], None] | None) -> list[_Outcome]:
-    """段②：逐窗口调 LLM，**不持有任何数据库事务**。"""
+              source: str, limit: int | None,
+              on_window: Callable[[int, int], None] | None,
+              checkpoints: dict[int, dict] | None = None,
+              persist_checkpoints: bool = False) -> list[_Outcome]:
+    """段②：逐窗口调 LLM，**不持有任何数据库事务**。
+
+    A5：`checkpoints` 命中的窗口直接恢复结果（不耗 limit、不计 stats.calls）——
+    上轮 LLMError 中断前已成功的窗口不再重付。`persist_checkpoints` 只在
+    生产自管连接路径开（测试/CLI 的 conn 路径由调用方管事务，落库写不进去）。
+    """
     outcomes: list[_Outcome] = []
     for idx, window in enumerate(todo, 1):
         if limit is not None and stats.calls >= limit:
@@ -306,6 +437,13 @@ def _call_llm(todo: list[Window], ctx: SessionCtx, client, stats: RouteStats, *,
         if window.is_summary and not ROUTE_SUMMARIES:
             stats.windows_skipped += 1
             outcomes.append(_Outcome(window, skipped=True))
+            continue
+        if checkpoints and window.anchor_id in checkpoints:
+            # ★ A5：命中 checkpoint，恢复上次结果，不再调 LLM。
+            stats.restored += 1
+            outcomes.append(_Outcome(
+                window, result=route_prompt.RouteResult.model_validate(
+                    checkpoints[window.anchor_id])))
             continue
         stats.windows += 1
         started = time.perf_counter()
@@ -322,34 +460,67 @@ def _call_llm(todo: list[Window], ctx: SessionCtx, client, stats: RouteStats, *,
             outcomes.append(_Outcome(window, parse_error=redact(str(exc))[:2000]))
             continue
         except LLMError:
-            raise  # 传输失败交给队列重试；此时还没写库 ⇒ 游标不动，重跑还是这批窗口
+            raise  # 传输失败交给队列重试；A5 保证已成功窗口有 checkpoint，重试只补余下
         stats.calls += 1
         stats.seconds += time.perf_counter() - started
+        if persist_checkpoints:
+            _save_checkpoint(window, result, source=source, ctx=ctx)
         outcomes.append(_Outcome(window, result=result))
     return outcomes
 
 
+def _precompute_section_embeddings(outcomes: list[_Outcome]) -> dict[str, object]:
+    """A10：把待办卡片要用的栏位向量在**写事务之外**算好。
+
+    谓词与 _decide → _queue_for_review 的送审路径一致：observation（无阈值全审）
+    或低于阈值的 atomic_fact/discard。文本键 = item.content or window.as_text()[:500]，
+    与 _queue_for_review 的取键完全相同，dict 命中即复用。
+    冷启动 15–33s 的向量模型加载/编码不再发生在写事务里（§5.5）。
+    """
+    texts: list[str] = []
+    for oc in outcomes:
+        if oc.result is None:
+            continue
+        for item in oc.result.items:
+            if item.kind != "observation":
+                floor = get_settings().route_confidence_thresholds.get(item.kind)
+                if floor is None or item.confidence >= floor:
+                    continue
+            texts.append(item.content or oc.window.as_text()[:500])
+    if not texts:
+        return {}
+    from ..core.embedding import get_embedding_service
+
+    service = get_embedding_service()
+    return {t: service.encode_one(t) for t in dict.fromkeys(texts)}
+
+
 def _write_outcomes(conn: Connection, *, source: str, ctx: SessionCtx, stats: RouteStats,
-                    outcomes: list[_Outcome]) -> None:
+                    outcomes: list[_Outcome],
+                    embeddings: dict[str, object] | None = None) -> None:
     """段③：把段② 的产物写库。调用方保证这里跑在一个短事务里。"""
     facts: list[dict] = []
     done_through = 0  # ★ 只在窗口**整个处理完**之后才推进；没进 outcomes 的窗口不动游标
     for oc in outcomes:
+        # ★ A6（W1）：游标推进取窗口**末行** id，与 _prepare 的过滤口径一致。
+        #   锚点是首行 id，超预算桶切出的后续窗口锚点不增长，用它推进会让游标
+        #   卡在桶首、下轮把这些窗口全量重判。
+        window_last_id = oc.window.rows[-1].id
         if oc.skipped:
-            done_through = oc.window.anchor_id
+            done_through = window_last_id
             continue
         if oc.result is None:
             stats.parse_failed += 1
             stats.pending += 1
             _insert_parse_failure(conn, oc.window, ctx, oc.parse_error)
-            done_through = oc.window.anchor_id
+            done_through = window_last_id
             continue
         for item in oc.result.items:
             stats.items += 1
-            payload = _decide(conn, item, oc.window, ctx, stats)
+            payload = _decide(conn, item, oc.window, ctx, stats, embeddings=embeddings)
             if payload:
                 facts.append(payload)
-        done_through = oc.window.anchor_id
+        done_through = window_last_id
 
     _finish(conn, source=source, ctx=ctx, stats=stats, facts=facts, new_cursor=done_through)
 
@@ -403,9 +574,19 @@ def _finish(conn: Connection, *, source: str, ctx: SessionCtx, stats: RouteStats
         "INSERT INTO extraction_cursor (source, session_id, last_log_id, prompt_ver, updated_at)"
         " VALUES (%s,%s,%s,%s,now())"
         " ON CONFLICT (source, session_id) DO UPDATE"
-        "   SET last_log_id=EXCLUDED.last_log_id, prompt_ver=EXCLUDED.prompt_ver,"
+        "   SET last_log_id=CASE"
+        "           WHEN extraction_cursor.prompt_ver=EXCLUDED.prompt_ver"
+        "           THEN GREATEST(extraction_cursor.last_log_id, EXCLUDED.last_log_id)"
+        "           ELSE EXCLUDED.last_log_id END,"
+        "       prompt_ver=EXCLUDED.prompt_ver,"
         "       updated_at=now()",
         (source, ctx.session_id, new_cursor, route_prompt.PROMPT_VER),
+    )
+    # ★ A5：游标已推进过这些窗口，checkpoint 的使命完成；换版残留一并清。
+    conn.execute(
+        "DELETE FROM route_checkpoints"
+        " WHERE session_id=%s AND (prompt_ver=%s AND first_msg_id<=%s OR prompt_ver<>%s)",
+        (ctx.session_id, route_prompt.PROMPT_VER, new_cursor, route_prompt.PROMPT_VER),
     )
 
 

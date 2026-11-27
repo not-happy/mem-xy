@@ -107,17 +107,21 @@ def _apply_accept(row: dict, payload: dict) -> dict:
     changed_by = payload.get("changed_by") or "summarizer"
     source_ids = row["source_ids"] or []
     with db.transaction() as tx:
-        # 幂等保护：job 可能在"写完但没来得及 complete"后被其它 worker 回收重放。
-        # history 里已有这个 proposal_id 就说明落过了，别再 version+1、别再叠 history。
-        if tx.execute("SELECT 1 FROM living_doc_history WHERE proposal_id=%s LIMIT 1",
-                      (row["id"],)).fetchone():
-            return {"action": "already_applied", "proposal_id": row["id"]}
+        # ★ A10：先 FOR UPDATE 锁住 living_doc 行，把"两个 worker 同时重放同一提案"
+        #   串行化——原来的顺序是先查 history 再锁，两个并发执行都能通过预查，
+        #   然后各 version+1（TOCTOU）。锁上之后再查 history，后到者一定看到先到者
+        #   写入的行（或被下面的部分唯一索引兜底拦住）。
         existing = tx.execute(
             "SELECT id, content, authority, version FROM living_doc"
             " WHERE org_key=%(org)s AND section_key=%(sec)s"
             "   AND project_key IS NOT DISTINCT FROM %(proj)s FOR UPDATE",
             {"org": row["org_key"], "sec": row["section_key"],
              "proj": row["project_key"]}).fetchone()
+        # 幂等保护：job 可能在"写完但没来得及 complete"后被其它 worker 回收重放。
+        # history 里已有这个 proposal_id 就说明落过了，别再 version+1、别再叠 history。
+        if tx.execute("SELECT 1 FROM living_doc_history WHERE proposal_id=%s LIMIT 1",
+                      (row["id"],)).fetchone():
+            return {"action": "already_applied", "proposal_id": row["id"]}
         if existing:
             tx.execute(
                 "UPDATE living_doc SET content=%s, authority='confirmed', origin='summarized',"
@@ -133,11 +137,19 @@ def _apply_accept(row: dict, payload: dict) -> dict:
                 (row["org_key"], row["project_key"], row["section_key"], final,
                  source_ids)).fetchone()["id"]
             new_version, old_content, old_authority = 1, None, None
-        tx.execute(
+        # ★ A10：partial UNIQUE(proposal_id)（migration 0007）兜底——即便上面两道
+        #   都被并发穿过，这里最多插入一行，后到者 rowcount=0 走 already_applied。
+        #   （ON CONFLICT 的冲突目标必须与部分索引谓词匹配。）
+        history = tx.execute(
             "INSERT INTO living_doc_history (living_doc_id, version, old_content, new_content,"
             "                               old_authority, new_authority, proposal_id, changed_by)"
-            " VALUES (%s,%s,%s,%s,%s,'confirmed',%s,%s)",
-            (doc_id, new_version, old_content, final, old_authority, row["id"], changed_by))
+            " VALUES (%s,%s,%s,%s,%s,'confirmed',%s,%s)"
+            " ON CONFLICT (proposal_id) WHERE proposal_id IS NOT NULL DO NOTHING"
+            " RETURNING id",
+            (doc_id, new_version, old_content, final, old_authority, row["id"], changed_by)
+        ).fetchone()
+        if history is None:
+            return {"action": "already_applied", "proposal_id": row["id"]}
     return {"action": "applied", "proposal_id": row["id"], "living_doc_id": doc_id,
             "version": new_version, "changed_by": changed_by}
 
