@@ -1957,3 +1957,12 @@ meta、ADD 动作显示「（新建，无原文）— → 提议」+ 逐条/批�
       auto_review 单配 endpoint 即可，代码已按 task='auto_review' 预留）。
 
 
+
+117. ★ **前端整体重构「记忆观测台 Observatory dark」：驾驶舱 + 分歧裁决为中心的 IA（2026-11-27）。**
+    - 起因：用户下令「整体重构UI，按照更智能更自动化的目标设计UI交互和视觉方案」（m02818）。此时双判共识制（#116）已上线——系统大多数判定不再需要人，UI 的旧信息架构（待办中心 Inbox 为首页、待办审核为第一组导航）已与"自动化优先"的系统形态脱节。
+    - 视觉定案：深色石墨 + 磷光青绿主色（#2dd4bf）+ 琥珀例外色；字体 Bahnschrift（仪表数字，Windows 自带）+ Microsoft YaHei UI（中文正文）+ Cascadia Mono（数据），零外部依赖；1px 发丝线 + 网格底纹 + 节点脉冲/虚线行进动画。styles.css 全量重写（391→870 行）但保留全部旧类名，15 个既有视图零改动自动换肤。
+    - 信息架构（与自动化形态对齐）：驾驶舱（新首页，替代 Inbox）→ 例外处理（分歧裁决 / 待审 diff——双判制下人工只看分歧卡）→ 记忆流水线（成文规范/观察池/记忆库/会话存档）→ 质量与调优（召回调试/指标/重跑）→ 系统。Inbox.jsx 删除。
+    - 驾驶舱 Cockpit.jsx：①流水线五节点图（采集→路由→双判→写入→召回，节点实时数字+状态色，可点跳转，节点间虚线行进动画表示流动）；②KPI 行：自动化率=1−suspend_rate（挺超 612/抽取判定 4428=86.2%）、hit@5、近 24h token、队列积压；③例外队列（分歧卡/落库失败/待审 diff 直达入口）+系统体征（后端/embedding 热冷/worker 在岗/栏位空置/高置信改判）+24h token 柱图。
+    - 其余改动：Sidebar 加 rail-foot 实时脚注（后端/embedding/worker/AUTOPILOT ON）；App.jsx 五组导航 + useWorkers 轮询；Pending.jsx 文案改"分歧裁决"叙事 + llm_review 第二遍意见升级为青绿面板；index.html title「mem-xy · 记忆观测台」+ color-scheme dark。
+    - 验证：npx vite build 通过（63 modules / dist css 20.12K + js 268.87K）；headless Edge 截图冒烟：驾驶舱真实数据全接通（后端在线/embedding 热 95.29ms·行/worker 2/4/分歧卡 136/自动化率 86.2%/hit@5 55%/p95 449.5ms 超预算标红——驾驶舱如实暴露了这两个真实问题，正是它的设计目的）。后端 StaticFiles 托管 dist，改 dist 即生效无需重启。
+    - 未做项：Pending 聚簇视图未按新视觉重排（逻辑原样保留）；驾驶舱"自动化率"口径与 #116 双判一致率统计是两个数，Phase C 统一指标页时再对齐；proposals/orgs/sections 等次要视图只吃全局换肤未做专属重排。

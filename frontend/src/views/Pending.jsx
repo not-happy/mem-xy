@@ -75,10 +75,9 @@ export default function Pending({ partition, onDecided }) {
     <div>
       {err && <div className="alert alert-error">{err}</div>}
       <div className="alert alert-info">
-        这里排队的都是<b>系统自己拿不准的裁决</b>：<Term en="route">路由判定</Term> = 模型给素材分类
-        （<Term en="observation">观察线索</Term> / <Term en="atomic_fact">零碎事实</Term> / 丢弃）没把握；
-        选栏位 = 分类定了但没匹配上受控栏位；查重 = 扫描发现两条已有记忆高度相似。
-        批准 = 按卡片下方字段写入记忆库，否决 = 这条线索永久出局。术语悬停都有解释。
+        <b>双判共识制在跑</b>：第二遍模型复核后，两遍判定一致的卡已自动落库。
+        到你手上的只有<b>两遍判得不一样的分歧卡</b>——这是系统仅剩的人工环节。
+        术语悬停都有解释；选栏位 = 分类定了但没匹配上受控栏位；查重 = 扫描发现两条已有记忆高度相似。
       </div>
       <div className="card row">
         <div className="field">
@@ -113,8 +112,10 @@ export default function Pending({ partition, onDecided }) {
 
       {items.length === 0 && !loading && (
         <EmptyState
-          title={status === 'pending' ? '没有待确认的线索' : `没有${enumItem('pending_status', status).zh}的待办`}
-          hint={status === 'pending' ? '系统拿不准的判定会在这里排队等人裁决。' : '换个状态筛选看看。'}
+          title={status === 'pending' ? '没有待裁的分歧卡' : `没有${enumItem('pending_status', status).zh}的待办`}
+          hint={status === 'pending'
+            ? '两遍判定一致时系统已自动落库；只有分歧卡会到这里排队。'
+            : '换个状态筛选看看。'}
         />
       )}
 
@@ -258,9 +259,9 @@ const PendingCard = forwardRef(function PendingCard({ it, action, canDecide, sec
       )}
 
       {s.llm_review && (
-        <div className="my-8">
+        <div className="llm-panel my-8">
           <div className="meta">
-            第二遍意见（两遍判得不一样才到你手上，已按第二遍预填可参考）：
+            第二遍模型意见（与第一遍不一致才轮到你，已按第二遍预填可参考）：
           </div>
           <div className="muted">
             {enumItem('kind', s.llm_review.kind)?.zh || s.llm_review.kind}

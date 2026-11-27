@@ -152,6 +152,9 @@ export const ENUMS = {
     default: { zh: '兜底', tone: 'warning' },
     rule: { zh: '规则命中', tone: 'info' },
     human: { zh: '人工确认', tone: 'success' },
+    // 双判共识制（B8）/ 白名单自动放行（B5-③）
+    llm_auto: { zh: '双判自动', tone: 'success' },
+    auto_repeat: { zh: '白名单自动', tone: 'info' },
   },
   pattern_type: {
     cwd_prefix: { zh: '目录前缀', tone: 'neutral' },

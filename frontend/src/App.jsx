@@ -4,7 +4,7 @@ import Sidebar from './components/Sidebar.jsx'
 import OrgProjectPicker from './components/OrgProjectPicker.jsx'
 import { ToastProvider, useToast } from './components/Toast.jsx'
 import { useHashTab } from './hooks/useHashTab.js'
-import Inbox from './views/Inbox.jsx'
+import Cockpit from './views/Cockpit.jsx'
 import Pending from './views/Pending.jsx'
 import LivingDocs from './views/LivingDocs.jsx'
 import Proposals from './views/Proposals.jsx'
@@ -20,36 +20,47 @@ import Replay from './views/Replay.jsx'
 import Sections from './views/Sections.jsx'
 import Settings from './views/Settings.jsx'
 
-/* 三组导航 = 使用频率分层：待办审核（天天看）/ 记忆内容（查阅）/ 系统维护（偶尔）。
- * key 同时是 hash 路由段（#/pending）与视图开关。 */
+/* 导航 IA（自动化优先重构）：机器干的放驾驶舱一眼看全，人只进「例外处理」裁
+ * 双判分歧卡；记忆内容 / 质量调优 / 系统维护按使用频率降频排后。
+ * key 同时是 hash 路由段（#/cockpit）与视图开关。 */
 const NAV_GROUPS = [
   {
-    title: '待办审核',
+    title: '驾驶舱',
     items: [
-      { key: 'inbox', label: '待办中心' },
-      { key: 'pending', label: '待确认' },
+      { key: 'cockpit', label: '驾驶舱' },
+    ],
+  },
+  {
+    title: '例外处理',
+    items: [
+      { key: 'pending', label: '分歧裁决' },
       { key: 'proposals', label: '待审 diff' },
     ],
   },
   {
-    title: '记忆内容',
+    title: '记忆流水线',
     items: [
       { key: 'docs', label: '成文规范' },
       { key: 'observations', label: '观察池' },
       { key: 'memories', label: '记忆库' },
       { key: 'conversations', label: '会话存档' },
-      { key: 'recall', label: '召回调试' },
     ],
   },
   {
-    title: '系统维护',
+    title: '质量与调优',
+    items: [
+      { key: 'recall', label: '召回调试' },
+      { key: 'metrics', label: '指标' },
+      { key: 'replay', label: '重跑' },
+    ],
+  },
+  {
+    title: '系统',
     items: [
       { key: 'attribution', label: '归属管理' },
-      { key: 'metrics', label: '指标' },
-      { key: 'jobs', label: '任务队列' },
-      { key: 'orgs', label: '组织管理' },
       { key: 'sections', label: '词表' },
-      { key: 'replay', label: '重跑' },
+      { key: 'orgs', label: '组织管理' },
+      { key: 'jobs', label: '任务队列' },
       { key: 'settings', label: '设置' },
     ],
   },
@@ -57,8 +68,8 @@ const NAV_GROUPS = [
 
 const TAB_KEYS = NAV_GROUPS.flatMap((g) => g.items.map((it) => it.key))
 const TAB_LABELS = Object.fromEntries(NAV_GROUPS.flatMap((g) => g.items.map((it) => [it.key, it.label])))
-/* 这五页是全库视角，不消费 org/project 分区——选择器置灰，避免「改了没反应」的困惑。 */
-const NO_PARTITION = new Set(['attribution', 'orgs', 'sections', 'replay', 'settings', 'jobs'])
+/* 这些页是全库视角，不消费 org/project 分区——选择器置灰，避免「改了没反应」的困惑。 */
+const NO_PARTITION = new Set(['cockpit', 'attribution', 'orgs', 'sections', 'replay', 'settings', 'jobs'])
 
 export default function App() {
   return (
@@ -69,11 +80,12 @@ export default function App() {
 }
 
 function Shell() {
-  const [tab, setTab] = useHashTab('inbox', TAB_KEYS)
+  const [tab, setTab] = useHashTab('cockpit', TAB_KEYS)
   // ★ 分区（org/project）在顶层管：多个视图都要按它过滤，放各自组件里会重复多份状态。
   const [org, setOrg] = useState('dida')
   const [project, setProject] = useState('')
   const health = useHealth()
+  const workers = useWorkers()
   const [counts, refreshCounts] = useTodoCounts(org, project)
 
   // 分区变了要给子视图一个信号去重新拉数据。用 key 强制重挂，比传 useEffect 依赖简单。
@@ -84,7 +96,13 @@ function Shell() {
 
   return (
     <div className="layout">
-      <Sidebar groups={NAV_GROUPS} tab={tab} onNavigate={setTab} counts={counts} />
+      <Sidebar
+        groups={NAV_GROUPS}
+        tab={tab}
+        onNavigate={setTab}
+        counts={counts}
+        status={{ health, workers }}
+      />
       <div className="main">
         <header className="topbar">
           <h1>{TAB_LABELS[tab]}</h1>
@@ -100,7 +118,7 @@ function Shell() {
         </header>
 
         <main className="content">
-          {tab === 'inbox' && <Inbox key={partitionKey} partition={partition} onNavigate={setTab} />}
+          {tab === 'cockpit' && <Cockpit onNavigate={setTab} />}
           {tab === 'pending' && <Pending key={partitionKey} partition={partition} onDecided={refreshCounts} />}
           {tab === 'proposals' && <Proposals key={partitionKey} partition={partition} onDecided={refreshCounts} />}
           {tab === 'docs' && <LivingDocs key={partitionKey} partition={partition} />}
@@ -154,8 +172,23 @@ function useHealth() {
   return health
 }
 
+/* worker 在岗 30s 轮询：只喂侧边栏脚注（x/max 在岗），失败静默。 */
+function useWorkers() {
+  const [workers, setWorkers] = useState(null)
+  useEffect(() => {
+    let alive = true
+    const load = () => api.listWorkers()
+      .then((w) => { if (alive) setWorkers(w) })
+      .catch(() => { if (alive) setWorkers(null) })
+    load()
+    const t = setInterval(load, 30000)
+    return () => { alive = false; clearInterval(t) }
+  }, [])
+  return workers
+}
+
 /* 侧边栏待办红点：pending 总数 + 待审 proposal 总数，60s 轮询。
- * 与 Inbox 页同源（listPending / listProposals 的 total），失败静默归 0 不干扰。
+ * 与 Cockpit 同源（listPending / listProposals 的 total），失败静默归 0 不干扰。
  * ★ 返回 [counts, refresh]：批准/否决成功后子视图立刻调 refresh 重拉红点，
  *   不用干等 60s 轮询（后端 list_pending 默认只算 pending+failed，裁决后 total 即时变化）。 */
 function useTodoCounts(org, project) {
