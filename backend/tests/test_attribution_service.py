@@ -34,7 +34,8 @@ def db():
 def _cleanup(_db):
     _db.execute("DELETE FROM memories WHERE content LIKE %s", (MARK + "%",))
     _db.execute("DELETE FROM conversation_log WHERE session_id LIKE %s", (MARK + "%",))
-    _db.execute("DELETE FROM workspace_map WHERE cwd IN (%s,%s)", (CWD, OTHER_CWD))
+    _db.execute("DELETE FROM workspace_map WHERE cwd LIKE %s OR cwd IN (%s,%s)",
+                (MARK + "%", CWD, OTHER_CWD))
     _db.execute("DELETE FROM org_match_rules WHERE pattern LIKE %s", (MARK + "%",))
 
 
@@ -188,3 +189,44 @@ def test_updating_a_missing_rule_raises_not_found(db):
         attribution.upsert_rule(rule_id=999_999_999, pattern_type="cwd_prefix",
                                 pattern=f"{MARK}x", org_key=ORG)
     assert exc.value.status == 404
+
+
+# ─────────────────────────── B7/W7：规则变更清缓存 ───────────────────────────
+
+def _seed_cache_rows(db):
+    """造三行缓存：rule 判的、default 兜底的、human 人工定的。"""
+    db.execute("INSERT INTO workspace_map (cwd, org_key, project_key, resolved_by)"
+               " VALUES (%s,%s,'dida/attr-repo','rule')", (CWD, ORG))
+    db.execute("INSERT INTO workspace_map (cwd, org_key, project_key, resolved_by)"
+               " VALUES (%s,'personal',NULL,'default')", (OTHER_CWD,))
+    db.execute("INSERT INTO workspace_map (cwd, org_key, project_key, resolved_by)"
+               " VALUES (%s,'dida','dida/kept','human')", (MARK + "C:/human-only/",))
+
+
+def _cache_cwds(db) -> set:
+    return {r["cwd"] for r in db.query("SELECT cwd FROM workspace_map")}
+
+
+def test_upsert_rule_clears_rule_and_default_cache_but_keeps_human(db):
+    _seed_cache_rows(db)
+    attribution.upsert_rule(pattern_type="cwd_prefix", pattern=f"{MARK}C:/new/",
+                            org_key=ORG, priority=80)
+    # rule/default 两行被清（下次扫描按新规则重判），human 行保留
+    assert _cache_cwds(db) == {MARK + "C:/human-only/"}
+
+
+def test_delete_rule_clears_rule_and_default_cache_but_keeps_human(db):
+    created = attribution.upsert_rule(pattern_type="cwd_prefix", pattern=f"{MARK}C:/del/",
+                                      org_key=ORG)
+    # upsert 已清过一轮，再补三行验证 delete 的行为
+    _seed_cache_rows(db)
+    attribution.delete_rule(created["id"])
+    assert _cache_cwds(db) == {MARK + "C:/human-only/"}
+
+
+def test_updating_a_missing_rule_does_not_touch_the_cache(db):
+    _seed_cache_rows(db)
+    with pytest.raises(LibraryError):
+        attribution.upsert_rule(rule_id=999_999_999, pattern_type="cwd_prefix",
+                                pattern=f"{MARK}x", org_key=ORG)
+    assert len(_cache_cwds(db)) == 3  # 失败路径不清缓存

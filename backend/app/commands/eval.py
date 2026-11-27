@@ -41,6 +41,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="跑全量评测并落 eval_runs（加载 bge-m3）")
     parser.add_argument("--k", type=int, default=None, help="覆盖 recall.k（默认用配置值）")
     parser.add_argument("--show", action="store_true", help="用例统计 + 最近跑批结果")
+    parser.add_argument("--harvest", type=int, default=None, metavar="N",
+                        help="从 recall_log 采 N 条真实 query 出候选清单（待人工标注），"
+                             "评测扩容的起点（ROADMAP B1：出题不再全靠模型）")
+    parser.add_argument("--dump", action="store_true",
+                        help="打印 active 记忆的 #id + hash 前 12 位 + 内容（标注 hash 用例的对照表）")
+    parser.add_argument("--check", action="store_true",
+                        help="健康检查：期望答案已失效（记忆被删/合并/改写）的用例清单")
     args = parser.parse_args(argv)
 
     if args.gen_candidates:
@@ -51,6 +58,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run(args.k)
     if args.show:
         return _show()
+    if args.harvest is not None:
+        return _harvest(args.harvest, Path(args.out))
+    if args.dump:
+        return _dump()
+    if args.check:
+        return _check()
     parser.print_help()
     return 0
 
@@ -163,6 +176,86 @@ def _import(path: Path) -> int:
     return 0
 
 
+# ─────────────────── --harvest：从真实提问扩容 ───────────────────
+
+def _harvest(n: int, out: Path) -> int:
+    """从 recall_log 采真实 query 出候选清单（ROADMAP B1：出题不再全靠模型）。
+
+    每条附 note=当时注入的记忆 id——标注者从"系统当时带了什么"入手判断
+    "该不该带、带对了吗"，比凭空出题快得多。expect/must_not 留空，人工标注。
+
+    ★ B6：用户在 UI 上标过 'useless' 的行优先全采（复查池的本体），
+      不足 n 条再用普通采样补齐——负标记 = 用户亲手说"这轮带错了"，
+      是最高价值的出题素材，不该和普通行混在一个采样池里排队。
+    """
+    useless = db.query(
+        "SELECT btrim(query_text) AS q, org_key, project_key, injected_ids"
+        " FROM recall_log"
+        " WHERE feedback = 'useless' AND length(btrim(query_text)) >= 2"
+        " ORDER BY created_at DESC LIMIT %s", (n,))
+    rest = n - len(useless)
+    rows = list(useless)
+    if rest > 0:
+        rows += db.query(
+            "SELECT DISTINCT ON (btrim(query_text))"
+            "  btrim(query_text) AS q, org_key, project_key, injected_ids"
+            " FROM recall_log"
+            " WHERE session_id <> 'eval-runner' AND length(btrim(query_text)) >= 2"
+            " ORDER BY btrim(query_text), created_at DESC"
+            " LIMIT %s", (rest,))
+    if not rows:
+        print("recall_log 里还没有真实 query（先用一段时间，或 hook 没接上）。")
+        return 1
+    # 行协议装不下多行/超长 query：压平空白 + 截断（贴 JSON 的原样 query 不是好评测题）
+    def _flat(q: str) -> str:
+        flat = " ".join(q.split())
+        return flat[:400] + "…" if len(flat) > 400 else flat
+
+    drafts = [CaseDraft(
+        query=_flat(row["q"]), org=row["org_key"], project=row["project_key"],
+        label="真实提问（待标注）",
+        note=("当时注入：" + " ".join(f"#{i}" for i in (row["injected_ids"] or [])[:5])
+              or "当时无注入")) for row in rows]
+    header = [
+        "# eval_recall_cases 候选清单（真实提问采集）",
+        f"<!-- 采集：{datetime.now():%Y-%m-%d %H:%M} | python -m app.commands.eval --harvest {n} -->",
+        "<!-- 每块的 note 列出了系统当时实际注入的记忆 id（标注起点，不判定对错）。 -->",
+        "<!-- 标注方法：对照 --dump 的记忆表，给 query 写 expect（该召回的 id）或 expect_hash； -->",
+        "<!-- 口语 query 就保留口语——真实分布正是要考的部分。标完 --import。 -->",
+    ]
+    out.write_text(render_candidate_file(drafts, header), encoding="utf-8")
+    print(f"已写 {out}：{len(drafts)} 条真实 query（全部待标注）。")
+    print("★ 标注后 --import；注：--import 不会动已有用例（幂等判重）。")
+    return 0
+
+
+def _dump() -> int:
+    rows = db.query(
+        "SELECT id, content_hash, scope, org_key, project_key, content FROM memories"
+        " WHERE status='active' ORDER BY id")
+    for row in rows:
+        ctx = row["org_key"] or ""
+        if row["project_key"]:
+            ctx += f" / {row['project_key']}"
+        print(f"#{row['id']} [{row['scope']}] {ctx} {row['content_hash'][:12]}"
+              f"  {row['content'][:80].replace(chr(10), ' ')}")
+    print(f"\\n共 {len(rows)} 条 active 记忆。hash 列写前 12 位即可（前缀匹配）。")
+    return 0
+
+
+def _check() -> int:
+    stale = stale_cases()
+    if not stale:
+        print("健康：所有用例的期望答案都能对上 active 记忆。")
+        return 0
+    print(f"★ {len(stale)} 条用例的期望答案已失效（记忆被删/合并/改写），评测前先修订：")
+    for item in stale:
+        print(f"  case#{item['case_id']} {item['query'][:50]}"
+              f"  expected_ids={item['expected_ids'] or '[]'}"
+              f"  expected_hashes={[h[:12] for h in item['expected_hashes']] or '[]'}")
+    return 0
+
+
 # ─────────────────── --run ───────────────────
 
 def _run(k: int | None) -> int:
@@ -177,6 +270,10 @@ def _run(k: int | None) -> int:
         print(f"\n未命中/泄漏 {len(summary.missed)} 条：")
         for item in summary.missed:
             print(f"  case#{item['case_id']} {item['query'][:50]} → got {item['got']}")
+    stale = stale_cases()
+    if stale:
+        print(f"★ {len(stale)} 条用例的期望答案已失效（--check 看明细）——"
+              f"hit@5 已被它们拖低，先修订再当基线用。")
     print(f"\n已落 eval_runs #{summary.run_id}")
     return 0
 

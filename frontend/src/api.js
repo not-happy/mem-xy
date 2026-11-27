@@ -69,6 +69,9 @@ export const api = {
   // 召回调试：debug 版多返回 query_text/keywords/每条两路名次，且不写 recall_log。
   recallDebug: (body) => request('POST', '/v1/recall/debug', body),
   recallLog: (p) => request('GET', `/v1/recall-log${qs(p)}`),
+  // B6：对一次真实召回标记"有用/没用"（null 撤销）；useless 的行进 eval 复查池。
+  recallLogFeedback: (id, feedback) =>
+    request('POST', `/v1/recall-log/${id}/feedback`, { feedback }),
 
   // 记忆库：浏览（all_scopes=true 看全库、不裁剪）、编辑、软删/恢复、看事件流水。
   listMemories: (p) => request('GET', `/v1/memories${qs(p)}`),
@@ -90,6 +93,13 @@ export const api = {
   listWorkers: () => request('GET', '/v1/workers'),
   startWorkers: (count) => request('POST', '/v1/workers/start', { count }),
   stopWorkers: () => request('POST', '/v1/workers/stop'),
+
+  // MCP 接入探视（integrations/mcp-server/mem_mcp.py）。★ stdio 由 AI 客户端拉起，
+  // 服务端不做"启动"；stop 默认只清父进程已退出的孤儿；selftest 走真连接（秒级）。
+  getMcpStatus: () => request('GET', '/v1/mcp/status'),
+  stopMcp: (orphansOnly) =>
+    request('POST', '/v1/mcp/stop', { orphans_only: orphansOnly !== false }),
+  mcpSelftest: () => request('POST', '/v1/mcp/selftest'),
 
   // 会话存档（conversation_log，ingest 落的原始对话）：列表 + 分页消息流。
   listConversations: (p) => request('GET', `/v1/conversations${qs(p)}`),

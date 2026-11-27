@@ -188,7 +188,10 @@ def test_recall_writes_the_audit_row_and_the_log_endpoint_joins_the_content_back
         client, db, monkeypatch):
     _stub_service(monkeypatch, ready=True)
     wanted = seed_memory(db, "pytest-api-审计对照", keywords=["审计对照"])
-    client.post("/v1/recall", json={"query": "审计对照", "session_id": SESSION,
+    # ★ B2 相关性门槛后，query 必须和 content 共享 token 才能过 0.5 的余弦线
+    #   （hash 词袋对 '审计对照' vs 'pytest-api-审计对照' 余弦恒 0）。直接拿
+    #   记忆原文当 query——本用例考的是审计落行与正文回拼，不是召回排序。
+    client.post("/v1/recall", json={"query": "pytest-api-审计对照", "session_id": SESSION,
                                     "org_key": ORG, "project_key": PROJECT})
 
     rows = client.get("/v1/recall-log", params={"session_id": SESSION}).json()
@@ -221,12 +224,50 @@ def test_the_debug_endpoint_leaves_no_audit_row(client, db, monkeypatch):
 def test_exclude_ids_stops_the_same_memory_being_injected_every_turn(client, db, monkeypatch):
     _stub_service(monkeypatch, ready=True)
     a = seed_memory(db, "pytest-api-排除对照", keywords=["排除对照"])
-    body = {"query": "排除对照", "session_id": SESSION,
+    # ★ B2 后同上：query 带上 content 原文，保证 dense 过得了 0.5 余弦线。
+    body = {"query": "pytest-api-排除对照", "session_id": SESSION,
             "org_key": ORG, "project_key": PROJECT}
 
     assert a in [i["memory_id"] for i in client.post("/v1/recall", json=body).json()["items"]]
     body["exclude_ids"] = [a]
     assert a not in [i["memory_id"] for i in client.post("/v1/recall", json=body).json()["items"]]
+
+
+@requires_db
+def test_recall_log_feedback_round_trip_and_audit_visibility(client, db, monkeypatch):
+    """B6（ROADMAP）：整轮"有用/没用"标记——写 recall_log.feedback、
+    GET /recall-log 带出来、再次 POST 可改判、null 可撤销。"""
+    _stub_service(monkeypatch, ready=True)
+    seed_memory(db, "pytest-api-反馈对照", keywords=["反馈对照"])
+    log_id = client.post("/v1/recall", json={"query": "反馈对照", "session_id": SESSION,
+                                             "org_key": ORG, "project_key": PROJECT}
+                         ).json()["recall_log_id"]
+
+    # 没标记时是 NULL（GET 带出键，值为 null）
+    rows = client.get("/v1/recall-log", params={"session_id": SESSION}).json()
+    assert rows[0]["feedback"] is None
+
+    # 标没用 → 审计行带出；再改有用 → 覆盖；撤销 → 回 NULL
+    assert client.post(f"/v1/recall-log/{log_id}/feedback",
+                       json={"feedback": "useless"}).json() == {"id": log_id, "feedback": "useless"}
+    assert client.get("/v1/recall-log", params={"session_id": SESSION}).json()[0]["feedback"] == "useless"
+    assert client.post(f"/v1/recall-log/{log_id}/feedback",
+                       json={"feedback": "useful"}).json()["feedback"] == "useful"
+    assert client.post(f"/v1/recall-log/{log_id}/feedback",
+                       json={"feedback": None}).json()["feedback"] is None
+    assert client.get("/v1/recall-log", params={"session_id": SESSION}).json()[0]["feedback"] is None
+
+
+@requires_db
+def test_recall_log_feedback_rejects_bad_kind_and_missing_row(client, db):
+    """非法值 422（pydantic pattern 兜着，不进 SQL）；行不存在 404 不是 500。"""
+    assert client.post("/v1/recall-log/1/feedback",
+                       json={"feedback": "great"}).status_code == 422
+    assert client.post("/v1/recall-log/999999999/feedback",
+                       json={"feedback": "useful"}).status_code == 404
+    body = client.post("/v1/recall-log/999999999/feedback",
+                       json={"feedback": "useful"}).json()["error"]
+    assert body["code"] == "log_not_found"
 
 
 @requires_db

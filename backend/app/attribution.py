@@ -112,11 +112,29 @@ def _reassign_memories(conn, cwd: str, org_key: str, project_key: str | None) ->
 
 # ─────────────────────────── 规则 ───────────────────────────
 
+def _invalidate_rule_cache() -> int:
+    """规则增改删后，清掉规则/默认来源的 workspace_map 缓存行（B7/W7）。
+
+    ★ 只清 `resolved_by<>'human'` 的行——人工确认过的归属优先级高于一切规则
+      （§5.1 边界情形），必须保留。清掉的行下次 resolve() 会按**新规则**重判
+      （git remote 现查 + match_rules + _persist 回写），不再沿用旧规则的历史缓存。
+    进行中的扫描握着自己的内存 _cache，把这一批扫完再失效——可接受的单次窗口。
+    """
+    removed = db.execute("DELETE FROM workspace_map WHERE resolved_by <> 'human'") or 0
+    if removed:
+        log.info("归属规则变更：清掉 %d 条规则/默认缓存行，下次扫描按新规则重判", removed)
+    return removed
+
+
 def upsert_rule(*, pattern_type: str, pattern: str, org_key: str,
                 project_key: str | None = None, priority: int = 50,
                 enabled: bool = True, rule_id: int | None = None) -> dict:
-    """新增或改一条 `org_match_rules`。★ 改规则不重判已缓存目录（那要重扫），
-    只对之后新见到的 cwd 生效——页面上会提示这一点。"""
+    """新增或改一条 `org_match_rules`。
+
+    ★ B7（W7）：写完规则就清掉规则/默认来源的 workspace_map 缓存行——
+      下次扫描所有非人工目录按新规则重判（每个目录多一次 git remote，一次性成本）。
+      人工确认过的行保留，不被新规则推翻。
+    """
     if pattern_type not in ("cwd_prefix", "git_remote_path", "git_remote_host"):
         raise LibraryError(400, "bad_pattern_type",
                            f"pattern_type 只能是 cwd_prefix/git_remote_path/git_remote_host，"
@@ -143,13 +161,16 @@ def upsert_rule(*, pattern_type: str, pattern: str, org_key: str,
         if not cur:
             raise not_found("归属规则", rule_id)
         new_id = rule_id
+    _invalidate_rule_cache()
     return db.query_one("SELECT id, pattern_type, pattern, org_key, project_key, priority,"
                         " enabled FROM org_match_rules WHERE id=%(id)s", {"id": new_id})
 
 
 def delete_rule(rule_id: int) -> dict:
-    """删一条规则。★ 已经靠它判过、缓存进 workspace_map 的目录不受影响（缓存还在）。"""
+    """删一条规则，并清掉规则/默认来源的 workspace_map 缓存行（B7/W7）——
+    下次扫描按剩余规则重判，靠旧规则判进去的目录不再固化。人工行保留。"""
     cur = db.execute("DELETE FROM org_match_rules WHERE id=%(id)s", {"id": rule_id})
     if not cur:
         raise not_found("归属规则", rule_id)
+    _invalidate_rule_cache()
     return {"deleted": rule_id}

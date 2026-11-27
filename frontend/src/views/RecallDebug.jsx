@@ -131,12 +131,24 @@ function RecallLog() {
   const { data, loading, reload } = useFetch(() => api.recallLog({ limit: 20 }), [])
   const rows = data || []
   const [open, setOpen] = useState(null)   // 同一时刻只展开一行
+  const [marking, setMarking] = useState(null) // 正在标记的行 id（防连点）
+  // B6：一键"有用/没用"。落 recall_log.feedback（整轮一个标记，不拆到每条记忆）；
+  // useless 的行会被 eval --harvest 优先采进复查池。null = 撤销。
+  const mark = async (id, feedback) => {
+    setMarking(id)
+    try {
+      await api.recallLogFeedback(id, feedback)
+      await reload()
+    } catch (e) {
+      alert(`标记失败：${e.message || e}`)
+    } finally { setMarking(null) }
+  }
   return (
     <div className="card mt-12">
       <div className="row">
         <span className="section-label">最近真实注入（recall_log）</span>
         <div className="spacer" />
-        <span className="meta">点击行看命中与注入详情</span>
+        <span className="meta">点击行看命中与注入详情；👍/👎 标记这轮带得对不对（👎 进复查池）</span>
         <button className="btn" onClick={reload} disabled={loading}>{loading ? '加载中…' : '刷新'}</button>
       </div>
       {rows.length === 0 && (
@@ -151,7 +163,18 @@ function RecallLog() {
             <span className="meta mono">{open === r.id ? '▾' : '▸'}</span>
             <span className="meta">#{r.id} · {fmtDateTime(r.created_at)} · {r.latency_ms}ms · {r.org_key}{r.project_key ? `/${r.project_key}` : ''}</span>
             <div className="spacer" />
+            {r.feedback === 'useful' && <Badge tone="success">👍 有用</Badge>}
+            {r.feedback === 'useless' && <Badge tone="danger">👎 没用 · 进复查池</Badge>}
             <Badge tone="neutral">命中 {r.hits?.length ?? 0} · 注入 {r.injected?.length ?? 0}</Badge>
+            {/* 按钮嵌在行里：stopPropagation 防止触发展开；再次点同一个 = 撤销。 */}
+            <span onClick={(e) => e.stopPropagation()} style={{ display: 'inline-flex', gap: 4 }}>
+              <button className="btn" disabled={marking === r.id}
+                      title={r.feedback === 'useful' ? '撤销标记' : '这轮带得对'}
+                      onClick={() => mark(r.id, r.feedback === 'useful' ? null : 'useful')}>👍</button>
+              <button className="btn" disabled={marking === r.id}
+                      title={r.feedback === 'useless' ? '撤销标记' : '这轮带错了（会进复查池）'}
+                      onClick={() => mark(r.id, r.feedback === 'useless' ? null : 'useless')}>👎</button>
+            </span>
           </div>
           {open === r.id && <RecallLogDetail r={r} />}
         </div>

@@ -89,7 +89,7 @@ export const ENUMS = {
     },
     dedup: {
       zh: '查重', tone: 'neutral',
-      hint: '疑似与已有记忆重叠、待人裁决合并或保留（预留阶段，当前流水线不产此卡）',
+      hint: '定时扫描发现两条已有记忆高度相似，等你裁决是否合并成一条（近重复合并卡）',
     },
     section: {
       zh: '选栏位', tone: 'warning',
@@ -197,6 +197,7 @@ export const ENUMS = {
 export const REASONS = {
   below_threshold: (param) => (param ? `置信度低于门槛 ${param}` : '置信度低于门槛'),
   section_unmatched: () => '未匹配到栏位',
+  near_duplicate: () => '两条记忆高度相似，建议合并',
 }
 export const SETTINGS_LABELS = {}  // Settings it.label
 export const SETTINGS_GROUPS = {}  // Settings it.group

@@ -54,6 +54,8 @@ export default function Jobs() {
 
       <WorkerControl />
 
+      <McpControl />
+
       <div className="card row">
         {FILTERS.map((f) => (
           <button
@@ -231,6 +233,165 @@ function WorkerControl() {
             ))}
           </tbody>
         </table>
+      )}
+    </div>
+  )
+}
+
+// MCP 接入探视（integrations/mcp-server/mem_mcp.py）。★ 故意没有"启动"按钮：
+// stdio MCP 是 AI 客户端（claude.exe 等）在会话里按需拉起的子进程，服务端代启
+// 只会造出无主进程（cwd 归属也是错的）。这里回答三件事：谁在跑、能不能跑
+// （脚本/包/注册）、跑得怎么样（recall_log source='mcp' 的近期活动）。
+const MCP_TONE = { running: 'success', orphaned: 'warn', ready: 'info', unregistered: 'warn', broken: 'danger' }
+const MCP_LABEL = {
+  running: '运行中', orphaned: '孤儿残留', ready: '就绪·未连接',
+  unregistered: '未注册', broken: '异常',
+}
+
+function McpControl() {
+  const [st, setSt] = useState(null)
+  const [err, setErr] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [selftest, setSelftest] = useState(null)
+  const { confirm, dialog } = useConfirm()
+  const toast = useToast()
+
+  const load = useCallback(() => {
+    api.getMcpStatus()
+      .then((d) => { setSt(d); setErr(null) })
+      .catch((e) => setErr(e.message || String(e)))
+  }, [])
+
+  useEffect(() => {
+    load()
+    const t = setInterval(load, 15000)   // 进程扫描较重（后端有 10s 缓存），轮询放宽到 15s
+    return () => clearInterval(t)
+  }, [load])
+
+  const cleanOrphans = async () => {
+    const sure = await confirm({
+      title: '清理 MCP 孤儿进程？',
+      body: '只结束父进程已退出的 mem_mcp.py 残留（客户端关了、adapter 还挂着）。'
+          + '活跃会话的 MCP 不受影响。',
+      danger: true,
+      okText: '清理',
+    })
+    if (!sure) return
+    setBusy(true)
+    try {
+      const d = await api.stopMcp(true)
+      toast.success(d.killed.length ? `已清理 ${d.killed.join('、')}` : '没有孤儿可清')
+      load()
+    } catch (e) {
+      setErr(e.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const runSelftest = async () => {
+    setBusy(true); setSelftest(null)
+    try {
+      const d = await api.mcpSelftest()
+      setSelftest(d)
+      toast[d.ok ? 'success' : 'error'](d.ok
+        ? `自检通过：5 个工具齐，${(d.latency_ms / 1000).toFixed(1)}s`
+        : `自检失败：${d.error || '未知错误'}`)
+      load()
+    } catch (e) {
+      setSelftest({ ok: false, error: e.message || String(e) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const copyConfig = async () => {
+    try {
+      await navigator.clipboard.writeText(st?.config_snippet || '')
+      toast.success('已复制，粘贴到 mcpServers 配置对象里')
+    } catch {
+      toast.error('复制失败（浏览器剪贴板权限）')
+    }
+  }
+
+  const procs = st?.processes || []
+  return (
+    <div className="card mb-12">
+      {dialog}
+      <div className="row">
+        <span className="section-label">MCP 接入 · mem_mcp</span>
+        <span className="meta">stdio · 由 AI 客户端按会话拉起，服务端不代启停</span>
+        <div className="spacer" />
+        {st && <Badge tone={MCP_TONE[st.verdict]}>{MCP_LABEL[st.verdict] || st.verdict}</Badge>}
+        <button className="btn" onClick={load} disabled={busy}>刷新</button>
+      </div>
+
+      {err && <div className="alert alert-error mt-8">{err}</div>}
+
+      {st && (
+        <>
+          <div className="row mt-10 meta">
+            <span>脚本 <span className="mono" title={st.script.path}>{st.script.exists ? '✓' : '✗ 缺失'}</span></span>
+            <span>mcp 包 {st.package.installed ? `✓ v${st.package.version}` : '✗ 未安装'}</span>
+            {st.activity.recalls_7d !== null ? (
+              <span>近 7 天 MCP 召回 <b>{st.activity.recalls_7d}</b> 次
+                {st.activity.last_recall_at ? ` · 最近 ${fmtDateTime(st.activity.last_recall_at)}` : ''}
+              </span>
+            ) : (
+              <span>近 7 天 MCP 召回 —（查不到）</span>
+            )}
+          </div>
+
+          <div className="row mt-8 meta">
+            {st.registration.map((r) => (
+              <span key={r.path} title={r.path}>
+                {r.path.split(/[\\/]/).pop()}：{r.registered
+                  ? (r.points_here ? '已注册 ✓' : '已注册（指向别处）')
+                  : '未注册'}
+              </span>
+            ))}
+            <div className="spacer" />
+            <button className="btn" onClick={copyConfig}>复制接入配置</button>
+            <button className="btn" onClick={runSelftest} disabled={busy}>连接自检</button>
+            <button className="btn red" onClick={cleanOrphans}
+                    disabled={busy || !st.orphan_count}>
+              清理孤儿{st.orphan_count ? ` (${st.orphan_count})` : ''}
+            </button>
+          </div>
+
+          {procs.length > 0 && (
+            <table className="tbl mt-10">
+              <thead>
+                <tr><th>PID</th><th>父进程</th><th>启动时间</th><th>状态</th></tr>
+              </thead>
+              <tbody>
+                {procs.map((p) => (
+                  <tr key={p.pid}>
+                    <td className="mono">{p.pid}</td>
+                    <td className="mono">{p.parent_name || '—'}{p.parent_pid ? ` (${p.parent_pid})` : ''}</td>
+                    <td className="meta">{fmtDateTime(p.started_at)}</td>
+                    <td>
+                      {p.orphan
+                        ? <Badge tone="warn">孤儿·父进程已退出</Badge>
+                        : <Badge tone="success">活跃</Badge>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          {selftest && (
+            <div className={`alert ${selftest.ok ? 'alert-success' : 'alert-error'} mt-10`}>
+              自检{selftest.ok ? '通过' : '失败'}
+              {selftest.latency_ms != null && ` · ${(selftest.latency_ms / 1000).toFixed(1)}s`}
+              {selftest.tools ? ` · ${selftest.tools.join(', ')}` : ''}
+              {selftest.error ? ` · ${selftest.error}` : ''}
+            </div>
+          )}
+
+          <div className="meta mt-8">{st.note}</div>
+        </>
       )}
     </div>
   )

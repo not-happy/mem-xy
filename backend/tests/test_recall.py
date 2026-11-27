@@ -56,9 +56,17 @@ def _hash_vector(text: str) -> list[float]:
 @pytest.fixture(autouse=True)
 def no_real_model(monkeypatch):
     monkeypatch.setattr(recall_mod, "get_embedding_service", lambda: FakeEmbedder())
-    # 词表固定住：真库里有 22 个栏位的 aliases，不锁住的话召回结果会随词表编辑而变
+    # 词表固定住：真库里有 22 个栏位的 aliases，不锁住的话召回结果会随词表编辑而变。
+    # ★ B2 之后哈希词袋的 cos≈0 会被 dense 门槛过滤，下方用例的召回依赖 keywords
+    #   通道——这些测试关键词必须进词表，query 侧才抽得出来（生产里路由 LLM 也是
+    #   从同一个词表抽的，语义一致）。
     monkeypatch.setattr(kw, "load_vocab",
-                        lambda *, force=False: frozenset({"婴儿票", "gds-agg", "dida"}))
+                        lambda *, force=False: frozenset({
+                            "婴儿票", "gds-agg", "dida",
+                            "验价", "发布", "后端", "改签", "软删",
+                            "排除对照", "审计对照", "续命", "不记日志", "评测不续命",
+                            "关键词锚点",
+                        }))
 
 
 @pytest.fixture(autouse=True)
@@ -222,12 +230,15 @@ def test_the_keyword_channel_puts_an_exact_identifier_match_first(db):
     target = seed_memory(db, content="pytest-recall-这个服务负责编排",
                          keywords=["bookingFlowService"])
     decoy = seed_memory(db, content="pytest-recall-这个服务也负责编排",
-                        keywords=["otherBookService"])
+                        keywords=["验价"])
 
-    got = do_recall(db, "bookingFlowService 是干什么的").items
+    got = do_recall(db, "bookingFlowService 验价 是干什么的").items
     assert got[0].memory_id == target
     assert "keywords" in got[0].channels
-    # ★ decoy 照样会出现（正文几乎一样，dense 一路把它捞回来了），但**排在后面**。
+    # ★ decoy 照样会出现：它的 keyword `编排` 也在 query 里（overlap=1），
+    #   但 target 是 `bookingFlowService` 完整标识符命中（overlap=1）且正文词袋
+    #   更贴近（哈希词袋下两者 dense 都过不了 0.5，RRF 里 kw 名次同为 1）——
+    #   平局时 RRF 仍按 overlap/名次稳定排序，断言只锁 target 在前。
     #   这才是 keywords 通道的真实作用：不是过滤，是把精确命中的那条顶到前面。
     by_id = {h.memory_id: h for h in got}
     assert by_id[target].score > by_id[decoy].score
@@ -244,12 +255,15 @@ def test_the_keyword_match_is_case_insensitive(db):
 
 def test_a_pure_chinese_query_still_recalls_through_the_dense_channel(db):
     """纯中文短句抽不出标识符 ⇒ keywords 通道整个不参与，RRF 只剩 dense 一路。
-    ★ 这是合法结果，不能为了"凑一个通道"去塞泛用词。"""
-    wanted = seed_memory(db, content="pytest-recall-改签必须先验价再出票", keywords=["改签"])
-    result = do_recall(db, "改签的流程是什么")
+    ★ 这是合法结果，不能为了"凑一个通道"去塞泛用词。
+    ★ 哈希词袋只认完全相同的 token（md5 槽）：query 两词必须原样出现在正文里，
+      cos(0.7071) 才能过 B2 门槛——这是词袋模拟的真实约束，用例造数要顺着它。"""
+    wanted = seed_memory(db, content="pytest-recall-先开 索引 再看 迭代扫描", keywords=[])
+    result = do_recall(db, "索引 迭代扫描")
     assert wanted in ids(result)
     hit = next(h for h in result.items if h.memory_id == wanted)
     assert hit.channels.get("dense") is not None
+    assert hit.channels.get("keywords") is None
 
 
 def test_a_memory_hit_by_both_channels_outranks_one_hit_by_only_one(db):
@@ -369,6 +383,48 @@ def test_the_project_name_augmentation_does_not_leak_fragments_into_the_keywords
     assert PROJECT.replace("/", " ") in result.query_text
 
 
+# ─────────────────────── A2：分段编码 + 加权混合（S1/H2） ───────────────────────
+
+def test_the_query_vector_blends_the_summary_tail_instead_of_truncating_it(db):
+    """★ A2-②（S1）：max_seq_length=128 是硬护栏（XLM-R tokenizer 下 128 token
+    ≈110-120 个汉字），把 summary 拼在 query 后面喂进去必然整段被右截断——
+    增广等于白做。改成 query 段与 tail 段分别编码后 0.75/0.25 加权混合。"""
+    query = "验价为什么报超时"
+    summary = "上一轮定位到是连接池没归还"
+    alone = recall_mod.build_query_vector(query, prev_assistant_summary=None,
+                                          project_key=None)
+    blended = recall_mod.build_query_vector(query, prev_assistant_summary=summary,
+                                            project_key=None)
+    assert alone != blended                     # tail 参与了向量
+    norm = sum(x * x for x in blended) ** 0.5
+    assert abs(norm - 1.0) < 1e-6               # 混合后重新归一化
+
+
+def test_the_blend_vector_with_no_tail_equals_the_plain_query_vector(db):
+    """没有 summary/project 增广时不做多余动作：向量就是 query 本体编码。"""
+    query = "bookingFlowService 报空指针怎么查"
+    plain = recall_mod.build_query_vector(query, prev_assistant_summary=None,
+                                          project_key=None)
+    via_fake = recall_mod.build_query_vector(query, prev_assistant_summary="",
+                                             project_key="")
+    assert plain == via_fake
+
+
+def test_the_tail_contribution_stays_at_a_quarter_weight(db):
+    """tail 只该轻微拉偏方向（0.25 权重），不能反客为主盖过 query 本体。"""
+    query = "婴儿票规则是什么"
+    summary = "完全无关的一段话"
+    q = recall_mod.build_query_vector(query, prev_assistant_summary=None,
+                                      project_key=None)
+    t = recall_mod.get_embedding_service().encode_one(summary)
+    blended = recall_mod.build_query_vector(query, prev_assistant_summary=summary,
+                                            project_key=None)
+    # 与 q 的余弦应该显著高于与 t 的余弦（0.75 权重 + 归一化后的几何关系）。
+    cos_q = sum(a * b for a, b in zip(blended, q))
+    cos_t = sum(a * b for a, b in zip(blended, t))
+    assert cos_q > cos_t
+
+
 def test_a_project_name_typed_by_the_user_still_counts_as_a_keyword(db):
     """用户自己在 query 里打了 `gds-agg`，它就该以**完整词**的形式命中——
     靠的是词表（`load_vocab` 收了 org 名和 repo 名），不是靠增广。"""
@@ -399,6 +455,50 @@ def test_the_eval_runner_can_recall_without_touching_the_audit_log(db):
     result = do_recall(db, "不记日志")            # write_log 默认 False
     assert result.recall_log_id is None
     assert db.query_one("SELECT count(*) c FROM recall_log")["c"] == before
+
+
+# ─────────────────────────── B3 召回即使用 ───────────────────────────
+
+def test_being_recalled_renews_last_seen_at(db):
+    """★ B3：衰减只认 last_seen_at（R1/H3）。一条 12 个月没被写入的记忆，只要真被
+    召回注入了，就说明它还活着——不续命的话它会按 2^-4 衰减，MENTION_CAP 补不回。"""
+    wanted = seed_memory(db, content="pytest-recall-续命", keywords=["续命"], age_days=365)
+    old = db.query_one("SELECT last_seen_at FROM memories WHERE id=%s", (wanted,))["last_seen_at"]
+
+    do_recall(db, "续命", write_log=True, source="pytest")
+
+    fresh = db.query_one("SELECT last_seen_at FROM memories WHERE id=%s", (wanted,))["last_seen_at"]
+    assert fresh > old, "真被召回注入的记忆，last_seen_at 必须刷新"
+    # updated_at 是"内容被修改"的记号，召回不算修改
+    row = db.query_one("SELECT updated_at, last_seen_at FROM memories WHERE id=%s", (wanted,))
+    assert row["updated_at"] is None or row["updated_at"] < row["last_seen_at"]
+
+
+def test_eval_recall_does_not_renew_last_seen(db):
+    """评测跑批（write_log=False）不回写：否则基线会人为抬高被测记忆的新鲜度。"""
+    wanted = seed_memory(db, content="pytest-recall-评测不续命", keywords=["评测不续命"],
+                         age_days=365)
+    old = db.query_one("SELECT last_seen_at FROM memories WHERE id=%s", (wanted,))["last_seen_at"]
+
+    do_recall(db, "评测不续命")                   # write_log 默认 False
+
+    fresh = db.query_one("SELECT last_seen_at FROM memories WHERE id=%s", (wanted,))["last_seen_at"]
+    assert fresh == old, "eval 路径不得触碰 last_seen_at"
+
+
+def test_only_the_injected_topk_gets_renewed(db):
+    """只有实际注入的 top-K 续命——dense pool 命中但没进 top-K 的不沾光。"""
+    strong = seed_memory(db, content="pytest-recall-续命-排前 关键词锚点",
+                         keywords=["关键词锚点"], mention_count=50)
+    weak = seed_memory(db, content="pytest-recall-续命-排后 关键词锚点",
+                       keywords=["关键词锚点"], mention_count=1, age_days=365)
+    weak_old = db.query_one("SELECT last_seen_at FROM memories WHERE id=%s", (weak,))["last_seen_at"]
+
+    result = do_recall(db, "关键词锚点", write_log=True, source="pytest", k=1)
+
+    assert ids(result) == [strong], "强记忆必须排第一，weak 落在 top-K 外"
+    weak_fresh = db.query_one("SELECT last_seen_at FROM memories WHERE id=%s", (weak,))["last_seen_at"]
+    assert weak_fresh == weak_old, "top-K 之外的记忆不续命"
 
 
 # ─────────────────────────── query 侧关键词 ───────────────────────────

@@ -197,6 +197,10 @@ function RulesCard({ data, action }) {
       {rules.length === 0 && (
         <EmptyState title="还没有规则" hint="没规则时所有目录都兜底判成 personal。" />
       )}
+      <div className="meta mt-6">
+        ★ 规则增、改、删后，机器判过的目录（含兜底）会在下次扫描时按新规则重新判定；
+        人工定过的目录不受影响。
+      </div>
     </div>
   )
 }
@@ -209,7 +213,7 @@ function RuleRow({ r, action, confirm }) {
   const del = async () => {
     const sure = await confirm({
       title: `删除规则 #${r.id}？`,
-      body: `「${r.pattern}」不再参与归属判定，它管着的目录会掉回兜底（personal）。`,
+      body: `「${r.pattern}」不再参与归属判定；已按旧规则判过的目录会在下次扫描时按剩余规则重新判定（人工定过的目录不受影响）。`,
       danger: true,
       okText: '删除',
     })

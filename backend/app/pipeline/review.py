@@ -27,6 +27,7 @@ from ..core.hashing import content_hash
 from ..core.redact import redact
 from ..prompts import route as route_prompt
 from ..queue import jobs
+from .facts import _event
 from .summarize import enqueue_summarize
 
 log = logging.getLogger(__name__)
@@ -126,12 +127,23 @@ def apply_decision(payload: dict) -> dict:
     #   模型冷时 encode_one 要 15–33s，关进事务就是 idle-in-transaction 占着连接。
     vectors = _prepare_vectors(row, merged) if kind == "observation" else None
 
+    # ★ B4-②：merge_pair 卡上人改过合并文案（不等于 A/B 任一原文）就要重算向量，
+    #   同样在事务外。原样批准（文案 = content_a/content_b）时零 encode。
+    new_embedding = None
+    if kind == "merge_pair":
+        new_content = merged.get("content")
+        if new_content and new_content not in (merged.get("content_a"),
+                                               merged.get("content_b")):
+            new_embedding = get_embedding_service().encode_one(new_content)
+
     try:
         with db.transaction() as tx:
             if kind == "atomic_fact":
                 outcome = _hand_to_writer(tx, row, merged)
             elif kind == "discard":
                 outcome = {"action": "discarded_by_human"}
+            elif kind == "merge_pair":
+                outcome = _merge_pair(tx, row, merged, new_embedding)
             else:
                 outcome = _write_observation(tx, row, merged, vectors)
             # ★ 退回人工的那几条**不能**标 done——`_bounce` 刚把状态写回 `pending`，
@@ -173,6 +185,16 @@ def _hand_to_writer(conn: Connection, row: dict, merged: dict) -> dict:
     if not merged.get("content"):
         _bounce(conn, row["id"], "no_content")
         return {"action": "bounced", "reason": "no_content"}
+    # ★ B7（W8）：scope=project 但这张卡片没有 project_key 时，write_facts 会把它
+    #   静默跳过（facts._facts_from 的防线拦整批 CHECK 冲突），卡片显示"完成"、
+    #   实际没入库——正是要消灭的静默丢弃。这里提前退回人工：要么先补归属
+    #   （归属页定 cwd 的 project_key），要么把 scope 改成 user/org 级再批。
+    scope = merged.get("scope") or "project"
+    if scope == "project" and not row["project_key"]:
+        _bounce(conn, row["id"], "no_project_key",
+                {"content": merged["content"], "scope": scope,
+                 "hint": "先在归属页给这个目录定 project_key，或把 scope 改成 user/org"})
+        return {"action": "bounced", "reason": "no_project_key"}
     job_id = jobs.enqueue(
         "write_facts",
         {"session_id": f"pending:{row['id']}", "source": "human-review",
@@ -186,6 +208,72 @@ def _hand_to_writer(conn: Connection, row: dict, merged: dict) -> dict:
                     "why": merged.get("why")}]},
         org_key=row["org_key"], dedup_key=f"write_facts:pending:{row['id']}", conn=conn)
     return {"action": "handed_to_write_facts", "job_id": job_id}
+
+
+def _merge_pair(conn: Connection, row: dict, merged: dict,
+                new_embedding: list[float] | None) -> dict:
+    """★ B4-②：近重复合并裁决的落库分支（卡由 app/dedup_scan.py 发）。
+
+    默认保留 id 较小的一条（老记忆带得动 mention 历史），软删另一条——与
+    facts.DELETE 同款软删（status='deleted'，内容留在 memory_events 可追溯）。
+    人改过合并文案时（resolution.content ≠ A/B 原文），保留行的 content /
+    content_hash / keywords（两行并集，W6 教训：不许全量替换成单行词表）/
+    mention_count（两行提及合并）一起更新，向量用事务外预算的 new_embedding。
+    """
+    ids = merged.get("memory_ids") or []
+    if len(ids) != 2 or ids[0] == ids[1]:
+        _bounce(conn, row["id"], "bad_merge_pair", {"memory_ids": ids})
+        return {"action": "bounced", "reason": "bad_merge_pair"}
+    keep_id, drop_id = sorted(int(i) for i in ids)
+
+    # FOR UPDATE 锁两行：并发 write_facts 正好在碰它们时不能插队。
+    keeper = conn.execute("SELECT * FROM memories WHERE id=%s FOR UPDATE",
+                          (keep_id,)).fetchone()
+    driver = conn.execute("SELECT * FROM memories WHERE id=%s FOR UPDATE",
+                          (drop_id,)).fetchone()
+    if (keeper is None or driver is None
+            or keeper["status"] != "active" or driver["status"] != "active"):
+        # 扫描之后这对已经被动过（多半被另一张卡合并掉了）→ 退回人工，
+        # 卡上还能看到当前状态，别替人做"丢了就算了"的决定。
+        _bounce(conn, row["id"], "pair_not_active",
+                {"keep_id": keep_id, "drop_id": drop_id,
+                 "kept_status": keeper["status"] if keeper else None,
+                 "dropped_status": driver["status"] if driver else None})
+        return {"action": "bounced", "reason": "pair_not_active"}
+
+    new_content = merged.get("content") or keeper["content"]
+    content_changed = new_content != keeper["content"]
+    if content_changed:
+        conn.execute(
+            "UPDATE memories SET content=%s, content_hash=%s, embedding=%s,"
+            "                    keywords=%s, revision_count=revision_count+1,"
+            "                    mention_count=mention_count+%s,"
+            "                    updated_at=now(), last_seen_at=now()"
+            " WHERE id=%s",
+            (new_content, content_hash(new_content), new_embedding,
+             sorted(set((keeper["keywords"] or []) + (driver["keywords"] or []))),
+             driver["mention_count"] or 0, keep_id))
+        _event(conn, keep_id, "UPDATE", keeper["content"], new_content,
+               keeper["source_msg"])
+    else:
+        # 原样合并：文案不动，只把另一条的提及与热度并过来。
+        conn.execute(
+            "UPDATE memories SET mention_count=mention_count+%s,"
+            "                    last_seen_at=now(), updated_at=now()"
+            " WHERE id=%s",
+            (driver["mention_count"] or 0, keep_id))
+        _event(conn, keep_id, "NOOP", None, None, keeper["source_msg"])
+
+    deleted = conn.execute(
+        "UPDATE memories SET status='deleted', updated_at=now()"
+        " WHERE id=%s AND status='active'", (drop_id,))
+    if deleted.rowcount == 0:
+        # 上面的 FOR UPDATE 已经验过 active，走到这里说明有并发改动了状态；
+        # 事务会带着保留行的更新一起提交，但要在结果里如实说明。
+        log.warning("merge_pair：drop_id=%s 在软删时已不是 active（并发改动）", drop_id)
+    _event(conn, drop_id, "DELETE", driver["content"], None, driver["source_msg"])
+    return {"action": "merged", "kept_id": keep_id, "deleted_id": drop_id,
+            "content_updated": content_changed}
 
 
 def _prepare_vectors(row: dict, merged: dict) -> dict | None:

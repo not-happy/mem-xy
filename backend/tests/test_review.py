@@ -10,6 +10,7 @@ import json
 import pytest
 from conftest import requires_db
 
+from app.core.hashing import content_hash
 from app.pipeline import review as review_mod
 
 pytestmark = requires_db
@@ -67,6 +68,13 @@ def db():
 
 
 def _cleanup(_db):
+    # ★ B4-②：merge 用例会造 memories/memory_events 行（外键挂在 conversation_log 上），
+    #   必须先删它们，conversation_log 才删得动。
+    _db.execute("DELETE FROM memory_events WHERE memory_id IN ("
+                " SELECT id FROM memories WHERE source_msg=%s OR content LIKE %s)",
+                (SOURCE_MSG, "pytest-review-%"))
+    _db.execute("DELETE FROM memories WHERE source_msg=%s OR content LIKE %s",
+                (SOURCE_MSG, "pytest-review-%"))
     _db.execute("DELETE FROM pending_items WHERE source_msg=%s OR raw_content LIKE %s",
                 (SOURCE_MSG, "pytest-review-%"))
     _db.execute("DELETE FROM raw_observations WHERE source_msg=%s OR content LIKE %s",
@@ -113,6 +121,31 @@ def observations(db) -> list[dict]:
 def run_job(db, pending_id, resolution=None) -> dict:
     return review_mod.apply_decision({"pending_id": pending_id,
                                       "resolution": resolution or {}})
+
+
+def seed_memory(db, content, *, scope="project", subject="project", role="fact",
+                keywords=(), mention_count=1, project_key=PROJECT) -> int:
+    """插一条已有记忆（B4-② merge 用例）。复用 db fixture 造好的 SOURCE_MSG 锚点。"""
+    return db.query_one(
+        "INSERT INTO memories (scope, org_key, project_key, subject, role, content,"
+        "                      content_hash, keywords, embedding, mention_count, source_msg)"
+        " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (scope, None if scope == "user" else ORG, project_key, subject, role, content,
+         content_hash(content), list(keywords), _hash_vector(content), mention_count,
+         SOURCE_MSG))["id"]
+
+
+def seed_merge_card(db, id_a: int, id_b: int, content_a: str, content_b: str) -> int:
+    """造一张与 dedup_scan.scan 落库形状一致的合并裁决卡（stage='dedup'）。"""
+    suggestion = {"kind": "merge_pair", "memory_ids": [id_a, id_b],
+                  "content_a": content_a, "content_b": content_b,
+                  "content": content_a, "scope": "project", "similarity": 0.9129}
+    return db.query_one(
+        "INSERT INTO pending_items (org_key, project_key, stage, raw_content, source_msg,"
+        "                            suggestion, reason, status, dedup_hash)"
+        " VALUES (%s,%s,'dedup',%s,%s,%s::jsonb,'near_duplicate','pending',%s) RETURNING id",
+        (ORG, PROJECT, f"【A · #{id_a}】{content_a}\n【B · #{id_b}】{content_b}", SOURCE_MSG,
+         json.dumps(suggestion, ensure_ascii=False), f"merge:{id_a}:{id_b}"))["id"]
 
 
 # ── 批准 / 否决 ──
@@ -329,6 +362,42 @@ def test_a_flip_back_to_atomic_fact_is_handed_to_the_four_action_writer(db):
     assert item["keywords"] == ["gds-agg", "86-"]
 
 
+def test_a_project_scope_fact_without_project_key_bounces_instead_of_vanishing(db):
+    """★ B7（W8）：卡片本身没有 project_key、人又把 scope 定成 project 时，
+    write_facts 会静默跳过这条（facts._facts_from 的防线），卡片却显示完成——
+    必须在交接前退回人工（先补归属，或改 scope），绝不静默丢。"""
+    pid = seed_pending(db, model_kind="observation",
+                       content="pytest-review-缺归属的工程事实",
+                       scope="project", subject="project", role="fact")
+    db.execute("UPDATE pending_items SET project_key=NULL WHERE id=%s", (pid,))
+    review_mod.approve(pid, {"kind": "atomic_fact", "scope": "project"})
+
+    outcome = run_job(db, pid, {"kind": "atomic_fact", "scope": "project"})
+
+    assert outcome == {"action": "bounced", "reason": "no_project_key"}
+    row = pending(db, pid)
+    assert row["status"] == "pending" and row["reason"] == "no_project_key"
+    # 没有排出 write_facts 任务（否则重放时还是会静默跳过）
+    assert db.query_one("SELECT 1 FROM jobs WHERE dedup_key=%s",
+                        (f"write_facts:pending:{pid}",)) is None
+
+
+def test_a_user_scope_fact_does_not_need_a_project_key(db):
+    """scope=user / org 级不需要 project_key——正常交接，别误伤。"""
+    pid = seed_pending(db, model_kind="observation",
+                       content="pytest-review-用户级事实不需要项目归属",
+                       scope="user", subject="user", role="preference")
+    db.execute("UPDATE pending_items SET project_key=NULL WHERE id=%s", (pid,))
+    review_mod.approve(pid, {"kind": "atomic_fact", "scope": "user"})
+
+    outcome = run_job(db, pid, {"kind": "atomic_fact", "scope": "user"})
+
+    assert outcome["action"] == "handed_to_write_facts"
+    job = db.query_one("SELECT * FROM jobs WHERE dedup_key=%s",
+                       (f"write_facts:pending:{pid}",))
+    assert job["payload"]["items"][0]["scope"] == "user"
+
+
 def test_a_human_discard_writes_nothing_and_closes_the_card(db):
     pid = seed_pending(db, model_kind="atomic_fact")
     review_mod.approve(pid, {"kind": "discard"})
@@ -420,3 +489,98 @@ def test_queue_stats_are_grouped_by_status_and_stage(db):
     assert delta["pending/route"] == 1
     assert delta["pending/section"] == 1
     assert delta["approved/route"] == 1
+
+
+# ── B4-② merge_pair：近重复合并卡的落库语义 ──
+
+def test_a_default_merge_keeps_the_older_row_and_soft_deletes_the_twin(db):
+    """★ 原样批准：保留 id 小的（老记忆带得动 mention 历史），软删另一条，
+    mention_count 归并到保留行上；卡片标 done。"""
+    id_a = seed_memory(db, "pytest-review-gds-agg 出票超时 要先查 网关日志",
+                       keywords=["gds-agg"], mention_count=3)
+    id_b = seed_memory(db, "pytest-review-gds-agg 出票超时 要先查 网关日志 呀",
+                       mention_count=2)
+    pid = seed_merge_card(db, id_a, id_b,
+                          "pytest-review-gds-agg 出票超时 要先查 网关日志",
+                          "pytest-review-gds-agg 出票超时 要先查 网关日志 呀")
+    review_mod.approve(pid)
+
+    outcome = run_job(db, pid)
+
+    assert outcome == {"action": "merged", "kept_id": id_a, "deleted_id": id_b,
+                       "content_updated": False}
+    keeper = db.query_one("SELECT * FROM memories WHERE id=%s", (id_a,))
+    driver = db.query_one("SELECT * FROM memories WHERE id=%s", (id_b,))
+    assert keeper["status"] == "active"
+    assert keeper["mention_count"] == 5          # 3 + 2 归并
+    assert driver["status"] == "deleted"
+    row = pending(db, pid)
+    assert row["status"] == "done"
+    actions = {e["memory_id"]: e["action"]
+               for e in db.query("SELECT memory_id, action FROM memory_events"
+                                 " WHERE memory_id IN (%s,%s)", (id_a, id_b))}
+    assert actions[id_a] == "NOOP" and actions[id_b] == "DELETE"
+
+
+def test_merge_with_an_edited_content_recomputes_vector_and_unions_keywords(db):
+    """★ 人改了合并文案：内容/哈希/向量重算，keywords 取并集，revision_count+1。"""
+    id_a = seed_memory(db, "pytest-review-gds-agg 枚举名 全大写",
+                       keywords=["gds-agg"])
+    id_b = seed_memory(db, "pytest-review-gds-agg 枚举名 全大写 吗",
+                       keywords=["枚举名"])
+    pid = seed_merge_card(db, id_a, id_b,
+                          "pytest-review-gds-agg 枚举名 全大写",
+                          "pytest-review-gds-agg 枚举名 全大写 吗")
+    new_content = "pytest-review-gds-agg 枚举名 一律 全大写"
+    review_mod.approve(pid, {"content": new_content})
+
+    outcome = run_job(db, pid, {"content": new_content})
+
+    assert outcome["action"] == "merged" and outcome["content_updated"] is True
+    assert outcome["kept_id"] == id_a and outcome["deleted_id"] == id_b
+    keeper = db.query_one("SELECT * FROM memories WHERE id=%s", (id_a,))
+    assert keeper["content"] == new_content
+    assert keeper["content_hash"] == content_hash(new_content)
+    assert keeper["embedding"].to_list() == pytest.approx(_hash_vector(new_content))
+    assert keeper["keywords"] == ["gds-agg", "枚举名"]     # 并集、有序
+    assert keeper["revision_count"] == 1
+    assert db.query_one("SELECT status FROM memories WHERE id=%s", (id_b,))["status"] == "deleted"
+    assert [e["action"] for e in db.query(
+        "SELECT action FROM memory_events WHERE memory_id=%s", (id_a,))] == ["UPDATE"]
+
+
+def test_merge_bounces_when_one_side_is_already_gone(db):
+    """★ 软删竞态：扫描发卡到人点批准之间，另一条已经被删/改死——退回人工，
+    卡片回 pending（bounced 不标 done），两边数据原样不动。"""
+    id_a = seed_memory(db, "pytest-review-gds-agg 出票超时 要先查 网关日志")
+    id_b = seed_memory(db, "pytest-review-gds-agg 出票超时 要先查 网关日志 呀")
+    pid = seed_merge_card(db, id_a, id_b,
+                          "pytest-review-gds-agg 出票超时 要先查 网关日志",
+                          "pytest-review-gds-agg 出票超时 要先查 网关日志 呀")
+    db.execute("UPDATE memories SET status='deleted' WHERE id=%s", (id_b,))
+    review_mod.approve(pid)
+
+    outcome = run_job(db, pid)
+
+    assert outcome == {"action": "bounced", "reason": "pair_not_active"}
+    row = pending(db, pid)
+    assert row["status"] == "pending" and row["reason"] == "pair_not_active"
+    assert db.query_one("SELECT status FROM memories WHERE id=%s", (id_a,))["status"] == "active"
+
+
+def test_merge_with_degenerate_ids_bounces(db):
+    """resolution 把 memory_ids 改坏（同一条/缺一条）→ 不落库，退回人工。"""
+    id_a = seed_memory(db, "pytest-review-gds-agg 出票超时 要先查 网关日志")
+    id_b = seed_memory(db, "pytest-review-gds-agg 出票超时 要先查 网关日志 呀")
+    pid = seed_merge_card(db, id_a, id_b,
+                          "pytest-review-gds-agg 出票超时 要先查 网关日志",
+                          "pytest-review-gds-agg 出票超时 要先查 网关日志 呀")
+    review_mod.approve(pid, {"memory_ids": [id_a, id_a]})
+
+    outcome = run_job(db, pid, {"memory_ids": [id_a, id_a]})
+
+    assert outcome == {"action": "bounced", "reason": "bad_merge_pair"}
+    row = pending(db, pid)
+    assert row["status"] == "pending" and row["reason"] == "bad_merge_pair"
+    assert db.query_one("SELECT status FROM memories WHERE id=%s", (id_a,))["status"] == "active"
+    assert db.query_one("SELECT status FROM memories WHERE id=%s", (id_b,))["status"] == "active"

@@ -58,6 +58,7 @@ class Settings:
     recall_k: int
     recall_dense_pool: int
     recall_rrf_k: int
+    recall_min_cosine: float
     hook_timeout_ms: int
     job_lease_seconds: int
     job_max_attempts: int
@@ -67,6 +68,12 @@ class Settings:
     backup_daily_at: str
     llm_max_retries: int
     cache_dir: Path
+    cleanup_retention_days: int
+    cleanup_older_days: int
+    dedup_scan_similarity: float
+    dedup_scan_max_cards: int
+    auto_repeat_similarity: float
+    auto_repeat_min_seen: int
 
     def endpoint_for(self, task: str) -> str:
         """The single place where a task is mapped to an endpoint (plan §9.1)."""
@@ -114,6 +121,23 @@ _DEFAULTS: dict = {
     # 每日备份触发时刻（backend 内置调度，绕开 SASE 对计划任务链拦 pg_dump，
     # 见 app/backup_daily.py 模块注释）；"off" 关闭。
     "backup": {"daily_at": "12:30"},
+    # ★ A9 保留期清理：
+    #   retention_days —— conversation_log 按 orgs.retention_days 的**兜底值**
+    #     （orgs 里没配的 org 用这个；orgs.retention_days=0 表示该 org 永不清）；
+    #   older_days —— 流水/日志类表的固定滚动窗口（90 天）。
+    "cleanup": {"retention_days": 180, "older_days": 90},
+    # ★ B4-② 近重复合并扫描（app/dedup_scan.py）：
+    #   similarity —— 自连接的余弦阈值（0.90 = pgvector 距离 ≤ 0.10）。只当
+    #     "拉出来看一眼"的预筛，判"是不是同一件事"的是人（卡片永不自动合并）；
+    #   max_cards —— 单轮最多发多少张卡（先出最像的一批，防止积压洪峰）。
+    "dedup_scan": {"similarity": 0.90, "max_cards": 50},
+    # ★ B5-③ 重复白名单（router._queue_for_review）：同分区同栏位的观察线索，如果
+    #   观察池里已有 ≥ min_seen 条近邻正面记录（即本条是第 min_seen+1 次出现），
+    #   就不再送人工、直接按模型预选落库；但近邻里有任何一条人工否决记录
+    #   （raw_observations.polarity='negative'）就永远不自动放行——人否决过的
+    #   边界比"省一次点击"值钱得多。similarity 取 0.92，比 dedup_scan 的 0.90
+    #   更严：这里是"没有人在场也敢写库"的门槛，不是"值得看一眼"的门槛。
+    "auto_repeat": {"similarity": 0.92, "min_seen": 3},
 }
 
 
@@ -191,6 +215,9 @@ def load_settings() -> Settings:
         recall_k=int(cfg.get("recall.k", 5)),
         recall_dense_pool=int(cfg.get("recall.dense_pool", 50)),
         recall_rrf_k=int(cfg.get("recall.rrf_k", 60)),
+        # B2 相关性门槛：dense 余弦距离上限（未归一化，0=全同，2=相反）。
+        # 0.5 ≈ bge-m3 相似度 0.5 以下不配注入；0=关掉这道关。用 B1 评测标定。
+        recall_min_cosine=float(cfg.get("recall.min_cosine", 0.5)),
         hook_timeout_ms=int(cfg.get("hook.timeout_ms", 400)),
         job_lease_seconds=int(cfg.get("queue.lease_seconds", 300)),
         job_max_attempts=int(cfg.get("queue.max_attempts", 5)),
@@ -201,6 +228,12 @@ def load_settings() -> Settings:
         backup_daily_at=os.environ.get("MEM_BACKUP_DAILY_AT") or cfg.get("backup.daily_at", "12:30"),
         llm_max_retries=int(cfg.get("llm.max_retries", 2)),
         cache_dir=CACHE_DIR,
+        cleanup_retention_days=int(cfg.get("cleanup.retention_days", 180)),
+        cleanup_older_days=int(cfg.get("cleanup.older_days", 90)),
+        dedup_scan_similarity=float(cfg.get("dedup_scan.similarity", 0.90)),
+        dedup_scan_max_cards=int(cfg.get("dedup_scan.max_cards", 50)),
+        auto_repeat_similarity=float(cfg.get("auto_repeat.similarity", 0.92)),
+        auto_repeat_min_seen=int(cfg.get("auto_repeat.min_seen", 3)),
     )
 
 

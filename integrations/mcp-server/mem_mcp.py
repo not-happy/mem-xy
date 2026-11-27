@@ -169,14 +169,21 @@ def _session_id(ctx: Context) -> str:
 # ─────────────────────────── 五个 tool ───────────────────────────
 
 @mcp.tool()
-async def memory_recall(ctx: Context, query: str, k: int = 5, cwd: str | None = None) -> dict:
+async def memory_recall(ctx: Context, query: str, k: int = 5, cwd: str | None = None,
+                        prev_assistant_summary: str | None = None) -> dict:
     """按语义 + 关键词召回相关记忆（跨会话）。拿不准「这事以前定过规矩吗」时用这个。
 
     ★ 结果**可能过期**：与当前代码冲突时以代码为准，并考虑用 `memory_correct` 纠掉。
+
+    prev_assistant_summary：上一轮回复的 1–3 句摘要（可选，≤2000 字符）。
+    连续指代（"那个函数再改改"）时传它，召回能对上上文。
     """
-    payload = await _call("POST", "/v1/recall", body={
-        "query": query, "k": k, "cwd": await _cwd(ctx, cwd),
-        "session_id": _session_id(ctx), "source": "mcp"})
+    body = {"query": query, "k": k, "cwd": await _cwd(ctx, cwd),
+            "session_id": _session_id(ctx), "source": "mcp"}
+    # ★ A2-③：与 hook 同款——摘要透传给后端做查询增广（后端再截 2000）。
+    if prev_assistant_summary:
+        body["prev_assistant_summary"] = prev_assistant_summary[:2000]
+    payload = await _call("POST", "/v1/recall", body=body)
     return {"items": [{"memory_id": i["memory_id"], "text": i["text"], "score": i["score"]}
                       for i in payload.get("items", [])],
             "latency_ms": payload.get("latency_ms")}

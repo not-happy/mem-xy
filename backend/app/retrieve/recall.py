@@ -184,6 +184,44 @@ def keyword_text(query: str, *, prev_assistant_summary: str | None = None) -> st
     return "\n".join(p for p in (query.strip(), (prev_assistant_summary or "").strip()) if p)
 
 
+# ★ A2（S1/H2）：增广内容进得了查询文本，却进不了向量——max_seq_length=128 是
+#   全局硬护栏（本文件头注释第 2 条），XLM-R tokenizer 下 128 token ≈ 110–120 个汉字，
+#   拼在后面的 summary / project 名会被**右截断**整个丢掉。修法是分段编码再混合：
+#   query 段保头部（内部被截也保住的是正文），summary+project 段单独编码，
+#   0.75/0.25 加权后重新归一化。代价是 encode 从一次变两次（88ms→~176ms，
+#   仍在 400ms 预算内），换来的是增广内容真实生效。
+_QUERY_MAX_CHARS = 300    # query 本体只送 300 字符进编码器（纯中文下略超 128 会被内部截，保头）
+_TAIL_SUMMARY_CHARS = 120 # summary 段预算（含 project 名行的空间）
+_QUERY_WEIGHT = 0.75
+_TAIL_WEIGHT = 0.25
+
+
+def _blend_vectors(query_vec: list[float], tail_vec: list[float] | None) -> list[float]:
+    """0.75·query + 0.25·tail 后重新 L2 归一化（两路输入本身都已归一）。"""
+    if not tail_vec or len(tail_vec) != len(query_vec):
+        return query_vec
+    blended = [_QUERY_WEIGHT * q + _TAIL_WEIGHT * t for q, t in zip(query_vec, tail_vec)]
+    norm = math.sqrt(sum(v * v for v in blended)) or 1.0
+    return [v / norm for v in blended]
+
+
+def build_query_vector(query: str, *, prev_assistant_summary: str | None = None,
+                       project_key: str | None = None) -> list[float]:
+    """A2：分段编码 + 加权混合，见 _blend_vectors 注释。"""
+    service = get_embedding_service()
+    head = query.strip()[:_QUERY_MAX_CHARS]
+    qvec = service.encode_one(head)
+    tail_parts = []
+    if prev_assistant_summary:
+        tail_parts.append(prev_assistant_summary.strip()[:_TAIL_SUMMARY_CHARS])
+    if project_key:
+        tail_parts.append(project_key.replace("/", " "))
+    if not tail_parts:
+        return qvec
+    tail_vec = service.encode_one("\n".join(tail_parts))
+    return _blend_vectors(qvec, tail_vec)
+
+
 def recall(*, query: str, cwd: str | None = None, org_key: str | None = None,
            project_key: str | None = None, session_id: str = "anonymous",
            turn_no: int | None = None, prev_assistant_summary: str | None = None,
@@ -203,7 +241,10 @@ def recall(*, query: str, cwd: str | None = None, org_key: str | None = None,
 
     query_text = build_query_text(query, prev_assistant_summary=prev_assistant_summary,
                                   project_key=project_key)
-    qvec = get_embedding_service().encode_one(query_text)
+    # ★ A2：分段编码 + 加权混合（summary/project 名不再被 128 token 右截断）。
+    #   query_text 仍保留给 recall_log 审计与 debug 口径。
+    qvec = build_query_vector(query, prev_assistant_summary=prev_assistant_summary,
+                              project_key=project_key)
     qkw = kw.extract(keyword_text(query, prev_assistant_summary=prev_assistant_summary))
 
     params = {
@@ -216,6 +257,13 @@ def recall(*, query: str, cwd: str | None = None, org_key: str | None = None,
     with db.transaction() as conn:
         db.enable_iterative_scan(conn)
         dense = conn.execute(_DENSE_SQL, params).fetchall()
+        # ★ B2 相关性门槛（R1）：dense 名次是"矮子里拔将军"，top-1 恒满分——
+        #   但 dist 是未归一化余弦距离，可以绝对判断。超过阈值的不进候选；
+        #   全被过滤时本轮注入为空（一等公民结果，寒暄/超短 query 不硬塞）。
+        #   keyword 通道是精确标识符命中，天然相关，不过滤。
+        min_cos = settings.recall_min_cosine
+        if min_cos > 0:
+            dense = [r for r in dense if r["dist"] <= min_cos]
         keyword_rows = conn.execute(_KEYWORDS_SQL, params).fetchall()
         fused = fuse(dense, keyword_rows, rrf_k=settings.recall_rrf_k)
         rows = _hydrate(conn, list(fused)) if fused else []
@@ -225,6 +273,9 @@ def recall(*, query: str, cwd: str | None = None, org_key: str | None = None,
                             session_id=session_id, turn_no=turn_no,
                             org_key=org_key, project_key=project_key,
                             source=source) if write_log else None
+        # ★ B3：真注入才续命；放事务最后一条语句，失败即整个召回失败（同事务语义，
+        #   但 UPDATE 极简、失败面小）。评测路径 write_log=False 天然不回写。
+        _touch_last_seen(conn, [h.memory_id for h in items]) if write_log else None
 
     return RecallResult(items=items, latency_ms=latency_ms, recall_log_id=log_id,
                         org_key=org_key, project_key=project_key,
@@ -291,6 +342,27 @@ def score(rows: list[dict], fused: dict[int, dict], *, now: float) -> list[Hit]:
     #   （dict 迭代顺序稳定，但 SQL 返回顺序不稳定），UI 上看着就像"记忆在飘"。
     hits.sort(key=lambda h: (-h.score, h.memory_id))
     return hits
+
+
+def _touch_last_seen(conn: Connection, ids: list[int]) -> int:
+    """B3：召回即使用——被实际注入的记忆续命 last_seen_at，衰减才看得到真实活跃度。
+
+    ★ 只在 write_log=True（真注入）时走；eval runner（write_log=False）不回写，
+      否则评测跑批会人为抬高被测记忆的新鲜度，基线就失真了。
+    ★ 并入召回同一事务（定案，见 decisions-log #114）：事务已存在、UPDATE 走主键
+      批量亚毫秒，独立任务反而引入失败面与延迟。
+    ★ 只更新 last_seen_at，不碰 updated_at——这不是"记忆被修改"，不该骗过
+      revision 展示；使用审计已有 recall_log.injected_ids，不另写 memory_events
+      （CHECK 只容 ADD/UPDATE/DELETE/NOOP/RESTORE，扩枚举牵动 UI，不值得）。
+    """
+    if not ids:
+        return 0
+    res = conn.execute(
+        "UPDATE memories SET last_seen_at = now()"
+        " WHERE id = ANY(%s::bigint[]) AND status = 'active'",
+        (list(ids),),
+    )
+    return res.rowcount
 
 
 def _write_log(conn: Connection, query_text: str, items: list[Hit],

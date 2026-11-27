@@ -126,7 +126,7 @@ def recall_log(limit: int = Query(default=50, ge=1, le=500),
     """召回审计。★ 只存 id + 分数，正文要现查 `memories`——
     把内容抄一份进日志就是第二份真相源，改了就对不上。"""
     sql = ("SELECT r.id, r.session_id, r.turn_no, r.query_text, r.org_key, r.project_key,"
-           "        r.hits, r.injected_ids, r.latency_ms, r.created_at"
+           "        r.hits, r.injected_ids, r.latency_ms, r.feedback, r.created_at"
            "  FROM recall_log r")
     params: dict = {"limit": limit}
     if session_id:
@@ -151,3 +151,27 @@ def recall_log(limit: int = Query(default=50, ge=1, le=500),
                       for mid in row["injected_ids"]]}
         for row in rows
     ])
+
+
+class RecallLogFeedback(BaseModel):
+    # B6：整轮一键标记。null = 撤销标记（允许改主意/标错了）。
+    feedback: str | None = Field(default=None, pattern="^(useful|useless)$")
+
+
+@router.post("/recall-log/{log_id}/feedback")
+def recall_log_feedback(log_id: int, body: RecallLogFeedback) -> JSONResponse:
+    """B6（ROADMAP）：对一次真实召回标记"有用/没用"。
+
+    - 落 recall_log.feedback（0009），不复用 memory_feedback——那张表
+      memory_id NOT NULL，"这轮都没用"要拆成 N 条才能表达，粒度错了。
+    - 'useless' 的行被 eval --harvest 优先采进复查池：用户亲手点的
+      "没用"是最高价值的评测出题素材。
+    - 读路径只做一次 UPDATE（走主键，亚毫秒），不碰 400ms 预算的
+      召回主链路。404 = 行不存在；非法值 pydantic 直接 422。
+    """
+    row = db.query_one(
+        "UPDATE recall_log SET feedback = %(fb)s WHERE id = %(id)s RETURNING id, feedback",
+        {"fb": body.feedback, "id": log_id})
+    if row is None:
+        return _error(404, "log_not_found", f"recall_log #{log_id} 不存在")
+    return JSONResponse({"id": row["id"], "feedback": row["feedback"]})

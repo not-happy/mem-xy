@@ -22,11 +22,12 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet("start", "stop", "restart", "log", "status", "help", "backup", "restore",
-                 "verify-backup", "watchdog", "install-watchdog", "uninstall-watchdog")]
+                 "verify-backup", "watchdog", "install-watchdog", "uninstall-watchdog", "eval")]
     [string]$Action = "help",
 
+    # eval 子命令的 dash 参数（如 --show）也会按位置落进 $Target——
+    # 因此这里不再用 ValidateSet，合法性由各动作自己把关（Start-Services/Show-Log 兜底）
     [Parameter(Position = 1)]
-    [ValidateSet("all", "backend", "frontend", "worker")]
     [string]$Target = "all",
 
     # 透传给 backup.ps1 的剩余参数（如 restore -DbName memxy -Force）
@@ -384,6 +385,28 @@ function Show-Status {
         $(if ($workerUp) { "Running" } else { "Stopped" }), `
         $(if ($workerUp) { " (PID: $($state.WorkerLauncher))" } else { "" })) `
         -ForegroundColor $(if ($workerUp) { "Green" } else { "Red" })
+
+    # MCP 探视：后端在时用它的 /v1/mcp/status（verdict 最全），否则本地粗扫进程。
+    # ★ stdio MCP 由 AI 客户端拉起，这里只报告，不启停（decisions-log #82/#83/#111）。
+    $mcp = $null
+    $mcpProcs = @(Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
+        Where-Object { $_.CommandLine -like "*mem_mcp.py*" -and $_.CommandLine -like "*mem-xy*" })
+    $mcpLine = if ($mcpProcs.Count -gt 0) {
+        "MCP     : {0} 个会话在跑（{1}）" -f $mcpProcs.Count,
+            (($mcpProcs | ForEach-Object { "PID $($_.ProcessId)" }) -join ", ")
+    } else {
+        "MCP     : 无活跃会话（stdio，AI 客户端连接时自动拉起）"
+    }
+    if ($backendUp) {
+        try {
+            $mcp = Invoke-RestMethod -Uri "http://127.0.0.1:$backendPort/v1/mcp/status" -TimeoutSec 10
+            $mcpLine = "MCP     : {0} | live={1} orphan={2} | 近7天召回 {3}" -f `
+                $mcp.verdict, $mcp.live_count, $mcp.orphan_count, `
+                $(if ($null -ne $mcp.activity.recalls_7d) { $mcp.activity.recalls_7d } else { "?" })
+        } catch { }
+    }
+    $mcpColor = if ($mcp -and $mcp.verdict -in @("unregistered", "broken")) { "Yellow" } else { "DarkGray" }
+    Write-Host $mcpLine -ForegroundColor $mcpColor
 }
 
 function Show-Log {
@@ -525,6 +548,7 @@ function Show-Help {
     Write-Host "    install-watchdog   注册计划任务：每 5 分钟探活，backend/worker 挂了自动拉起"
     Write-Host "    uninstall-watchdog 移除 watchdog 计划任务"
     Write-Host "    watchdog           手动跑一次 watchdog（调试用）"
+    Write-Host "    eval               召回评测：eval --run/--show/--check/--harvest N/--import（透传 backend eval.py）"
     Write-Host "    help               显示本帮助信息"
     Write-Host ""
     Write-Host "  对象（可选，默认 all）:" -ForegroundColor Yellow
@@ -554,5 +578,24 @@ switch ($Action) {
     "watchdog"           { & "$root\watchdog.ps1" @ExtraArgs; exit $LASTEXITCODE }
     "install-watchdog"   { Install-Watchdog }
     "uninstall-watchdog" { Uninstall-Watchdog }
+    "eval" {
+        # 召回评测（ROADMAP B1）：参数透传给 backend eval.py
+        #   .\service.ps1 eval --run        跑全量评测落 eval_runs（加载 bge-m3，数十秒）
+        #   .\service.ps1 eval --show       用例统计 + 最近跑批
+        #   .\service.ps1 eval --check      期望答案失效检查（--dump 是标注对照表）
+        #   .\service.ps1 eval --harvest 30 从 recall_log 采真实 query 出候选清单
+        #   .\service.ps1 eval --import .\eval-candidates.md
+        # ★ 第一个 dash 参数会按位置落进 $Target（PowerShell 参数绑定），这里拼回原顺序
+        $evalArgs = @()
+        if ($Target -and $Target -notmatch '^(all|backend|frontend|worker)$') { $evalArgs += $Target }
+        $evalArgs += $ExtraArgs
+        Push-Location "$root\backend"
+        try {
+            python -m app.commands.eval @evalArgs
+            exit $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
+    }
     "help"    { Show-Help }
 }

@@ -28,6 +28,7 @@ from .conversations import router as conversations_router
 from .docs import router as docs_router
 from .ingest import router as ingest_router
 from .jobs import router as jobs_router
+from .mcp import router as mcp_router
 from .memories import router as memories_router
 from .metrics import router as metrics_router
 from .orgs import router as orgs_router
@@ -128,6 +129,7 @@ app.include_router(replay_router)
 app.include_router(sections_router)
 app.include_router(settings_router)
 app.include_router(workers_router)
+app.include_router(mcp_router)
 
 
 @app.get("/healthz")

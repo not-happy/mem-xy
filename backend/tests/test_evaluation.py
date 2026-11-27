@@ -244,3 +244,173 @@ class TestImportAndRun:
     def test_run_eval_on_empty_table_raises(self, clean_tables):
         with pytest.raises(RuntimeError, match="为空"):
             evaluation.run_eval()
+
+
+# ─────────────────── B1：content_hash 判定（id 钉死的替代） ───────────────────
+
+
+class TestHashPureFunctions:
+    """hash 判定纯函数手算用例（不碰库）。"""
+
+    def test_hashes_hit_prefix_match(self):
+        # expected 是 12 位前缀，ranked 里是完整 64 位 hash——前缀命中
+        assert evaluation.hashes_hit(["b2c7f64891a2"],
+                                     ["", "b2c7f64891a2deadbeef", "4867b0"], k=5)
+
+    def test_hashes_hit_outside_k_ignored(self):
+        ranked = [""] * 5 + ["b2c7f64891a2deadbeef"]
+        assert not evaluation.hashes_hit(["b2c7f64891a2"], ranked, k=5)
+
+    def test_first_hit_rank_prefers_earliest_across_dimensions(self):
+        # id 在第 2 名命中，hash 没命中 → 取 2
+        assert evaluation.first_hit_rank([5], [1, 5, 9],
+                                         expected_hashes=["aaaaaaaaaaaa"],
+                                         ranked_hashes=["", "", "b2c7f64891a2"]) == 2
+        # hash 在第 2 名命中（expected 全为假记忆 id，hash 维命中才算）
+        # ★ ranked 与 ranked_hashes 必须同长——hash 维是"第 rank 名的记忆 hash"
+        assert evaluation.first_hit_rank([999], [101, 102, 103],
+                                         expected_hashes=["b2c7f64891a2"],
+                                         ranked_hashes=["", "b2c7f64891a2fff", ""]) == 2
+        # 双维都命中时取最先的那次
+        assert evaluation.first_hit_rank([7], [7, 1],
+                                         expected_hashes=["4867b0112233"],
+                                         ranked_hashes=["4867b0112233aa", ""]) == 1
+
+    def test_first_hit_rank_miss_is_zero(self):
+        assert evaluation.first_hit_rank([5], [1, 2, 3]) == 0
+        assert evaluation.first_hit_rank([], [],
+                                         expected_hashes=["b2c7f64891a2"],
+                                         ranked_hashes=["", "4867b0"]) == 0
+
+    def test_first_hit_rank_beyond_cap(self):
+        ranked = list(range(1, 12))
+        hashes = [""] * 11 + ["b2c7f64891a2"]
+        assert evaluation.first_hit_rank([99], ranked + [99],
+                                         expected_hashes=["b2c7f64891a2"],
+                                         ranked_hashes=hashes + ["b2c7f64891a2"]) == 0
+
+    def test_hashes_leaked(self):
+        assert evaluation.hashes_leaked(["b2c7f64891a2"],
+                                        ["x", "b2c7f64891a2ab"], k=5)
+
+
+class TestHashFileProtocol:
+    """hash 行的 render/parse round-trip 与坏块。"""
+
+    def test_hash_round_trip(self):
+        drafts = [
+            evaluation.CaseDraft(query="hash 正例", expect_hashes=["b2c7f64891a2"], org=ORG),
+            evaluation.CaseDraft(query="hash 否定例", must_not_hashes=["4867b0112233"]),
+            evaluation.CaseDraft(query="id+hash 双标", expect=[1], expect_hashes=["cccc00001111"]),
+        ]
+        text = evaluation.render_candidate_file(drafts, ["# 头"])
+        parsed, errors = evaluation.parse_candidate_file(text)
+        assert errors == []
+        assert parsed[0].expect_hashes == ["b2c7f64891a2"] and parsed[0].expect == []
+        assert parsed[1].must_not_hashes == ["4867b0112233"]
+        assert parsed[2].expect == [1] and parsed[2].expect_hashes == ["cccc00001111"]
+
+    def test_short_hash_rejected(self):
+        text = "## case\n- query: q\n- expect_hash: b2c7f6\n"   # <12 位
+        drafts, errors = evaluation.parse_candidate_file(text)
+        assert drafts == []
+        assert len(errors) == 1 and "12" in errors[0]
+
+    def test_all_empty_still_rejected_even_with_hash_check(self):
+        text = "## case\n- query: q\n"   # expect/must_not/hash 全空
+        drafts, errors = evaluation.parse_candidate_file(text)
+        assert drafts == [] and len(errors) == 1
+
+
+class TestHashJudgment:
+    """hash 判定的库链路：import 判重 / run_eval 命中 / stale 检出 / config 快照。"""
+
+    @pytest.fixture(autouse=True)
+    def _gate(self, request):
+        import conftest
+        if not conftest.DB_AVAILABLE:
+            pytest.skip("no database")
+
+    def test_import_dedup_includes_hashes(self, clean_tables):
+        base = [evaluation.CaseDraft(query="hash 判重用例",
+                                     expect_hashes=["b2c7f64891a2"], org=ORG)]
+        assert evaluation.import_cases(base) == {"inserted": 1, "skipped": 0}
+        assert evaluation.import_cases(base) == {"inserted": 0, "skipped": 1}
+        # hash 变了 = 新用例（内容指纹不同，判的就不是同一条记忆）
+        changed = [evaluation.CaseDraft(query="hash 判重用例",
+                                        expect_hashes=["4867b0112233"], org=ORG)]
+        assert evaluation.import_cases(changed) == {"inserted": 1, "skipped": 0}
+        from app.core import db
+        assert db.query_one("SELECT count(*) n FROM eval_recall_cases")["n"] == 2
+
+    def test_run_eval_hash_hit_and_stale(self, clean_tables, fake_model):
+        from app.core import db
+        content = "pytest-eval-hash 改签验价必须先 RetrievePnr"
+        _insert_memory(content, ["改签"])
+        hash12 = hashlib.sha256(content.encode()).hexdigest()[:12]
+        evaluation.import_cases([
+            evaluation.CaseDraft(query="pytest-eval-hash 改签验价必须先 RetrievePnr",
+                                 expect_hashes=[hash12], org=ORG),
+        ])
+        summary = evaluation.run_eval(k=5)
+        assert summary.positives == 1
+        assert summary.hit_at_5 == 1.0 and summary.mrr_at_10 == 1.0
+        assert summary.missed == []
+        # 内容还在（哪怕记忆被合并改写）→ hash 命中 → 不 stale
+        assert evaluation.stale_cases() == []
+
+        run = evaluation.latest_run()
+        cfg = run["config"]
+        for key in ("k", "pool", "rrf_k", "scope_weights", "half_life_days",
+                    "mention_cap", "mention_coef", "cases", "positives", "negatives"):
+            assert key in cfg, key
+
+        # 记忆软删 → 内容没了 → expect_hash 失效（红）；id 失效同样红
+        db.execute("UPDATE memories SET status='deleted' WHERE org_key=%s", (ORG,))
+        stale = evaluation.stale_cases()
+        assert len(stale) == 1
+        assert stale[0]["expected_hashes"] == [hash12]
+
+
+class TestHarvest:
+    """B6：--harvest 的复查池语义——用户标过 'useless' 的行优先全采。"""
+
+    @pytest.fixture(autouse=True)
+    def _gate(self, request):
+        import conftest
+        if not conftest.DB_AVAILABLE:
+            pytest.skip("no database")
+
+    SESSION = "pytest-eval-harvest"
+
+    def _seed_log(self, query: str, feedback: str | None, session: str | None = None):
+        from app.core import db
+        return db.query_one(
+            "INSERT INTO recall_log (session_id, query_text, hits, injected_ids, feedback)"
+            " VALUES (%s, %s, '[]'::jsonb, '{}', %s) RETURNING id",
+            (session or self.SESSION, query, feedback))["id"]
+
+    def test_useless_rows_go_first_and_normal_rows_fill_the_rest(self, tmp_path):
+        from app.commands import eval as eval_cmd
+        from app.core import db
+        u1 = self._seed_log("pytest-eval 负标记的一号", "useless")
+        self._seed_log("pytest-eval 负标记的一号", None)      # 同 query 的普通行，应被负标记挤掉
+        self._seed_log("pytest-eval 普通采样二号", None)
+        self._seed_log("pytest-eval 普通采样三号", None)
+        # eval-runner 的行不采（runner 自产的 query 不是考题）
+        self._seed_log("pytest-eval runner 自产", None, session="eval-runner")
+        try:
+            out = tmp_path / "candidates.md"
+            assert eval_cmd._harvest(2, out) == 0
+            text = out.read_text(encoding="utf-8")
+            assert "pytest-eval 负标记的一号" in text
+            # n=2：负标记占 1 席，剩 1 席从普通行补——且 runner 行绝不出现
+            assert "pytest-eval runner 自产" not in text
+            blocks = [ln for ln in text.splitlines() if ln.startswith("## ")]
+            assert len(blocks) == 2
+            pos = {q: i for i, q in enumerate(blocks)}
+            assert pos.get("## pytest-eval 负标记的一号", 99) < pos.get(
+                "## pytest-eval 普通采样二号", 99) or \
+                "pytest-eval 普通采样二号" not in text
+        finally:
+            db.execute("DELETE FROM recall_log WHERE session_id=%s", (self.SESSION,))

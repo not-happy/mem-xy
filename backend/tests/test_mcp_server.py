@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import urllib.request
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -25,7 +26,11 @@ from mcp.client.stdio import stdio_client
 
 SERVER = str(Path(__file__).resolve().parents[2] / "integrations" / "mcp-server" / "mem_mcp.py")
 PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
-MARK = "pytest-mcp-"
+# ★ MARK 带每次运行的随机段：写路径走 HTTP → **生产库**（在线服务连的库），而知识库
+#   本身会收录提到本测试约定的记忆（2026-11-16 实踩：#2672 的内容里就有"pytest-mcp-"，
+#   memory_search(q=MARK) 数出 2 条 → total==1 断言炸）。固定前缀不再保证唯一，
+#   随机段让"本运行写入的"与"库里任何既存内容"天然可分；清理按同前缀，无残留。
+MARK = f"pytest-mcp-{uuid.uuid4().hex[:8]}-"
 FIVE_TOOLS = {"memory_recall", "memory_note", "memory_correct", "memory_search", "memory_pending"}
 
 
