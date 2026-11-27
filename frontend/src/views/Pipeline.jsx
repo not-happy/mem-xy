@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { memo, useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
 import Badge from '../components/Badge.jsx'
 import EmptyState from '../components/EmptyState.jsx'
@@ -16,10 +16,11 @@ const sumByStatus = (byStatus, pred) => Object.entries(byStatus || {})
   .filter(([k]) => pred(k))
   .reduce((n, [, v]) => n + v, 0)
 
-export default function Pipeline({ onOpen }) {
+export default memo(function Pipeline({ onOpen }) {
   const [snap, setSnap] = useState(null)
   const [error, setError] = useState(null)
   const [updatedAt, setUpdatedAt] = useState(null)
+  const prevSigRef = useRef(null)
 
   const load = () => {
     // 六路只读并发；任何一路炸了不拖垮整屏（单独置 null 显示 —）。
@@ -31,14 +32,19 @@ export default function Pipeline({ onOpen }) {
       api.listProposals({ status: 'pending', limit: 1 }),
       api.metrics({}),
     ]).then(([h, w, j, p, pr, m]) => {
-      setSnap({
+      const next = {
         health: h.status === 'fulfilled' ? h.value : null,
         workers: w.status === 'fulfilled' ? w.value : null,
         jobs: j.status === 'fulfilled' ? j.value?.summary : null,
         pending: p.status === 'fulfilled' ? p.value : null,
         proposals: pr.status === 'fulfilled' ? pr.value : null,
         metrics: m.status === 'fulfilled' ? m.value : null,
-      })
+      }
+      // 数字没变就不动状态：轮询大多数轮次拿到的是同一份数据，跳过省一次整树重渲。
+      const sig = JSON.stringify(next)
+      if (sig === prevSigRef.current) return
+      prevSigRef.current = sig
+      setSnap(next)
       setUpdatedAt(new Date())
       setError(h.status === 'rejected' ? '后端不可达（uvicorn 停了吗？）' : null)
     })
@@ -51,6 +57,13 @@ export default function Pipeline({ onOpen }) {
     const t = setInterval(load, live > 0 ? 10000 : 30000)
     return () => clearInterval(t)
   }, [live])
+
+  // 标签页不可见时不再空转，回前台立即补一次采样。
+  useEffect(() => {
+    const onVis = () => { if (!document.hidden) load() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [])
 
   const pend = snap?.pending
   const pendingNow = sumByStatus(pend?.by_status, (k) => k.startsWith('pending/'))
@@ -208,7 +221,7 @@ export default function Pipeline({ onOpen }) {
       </div>
     </div>
   )
-}
+})
 
 const fmtNum = (n) => (n == null ? '—' : Number(n).toLocaleString())
 

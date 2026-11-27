@@ -64,7 +64,7 @@
   --node-glow: rgba(13, 148, 136, .10);
   --overlay: rgba(15, 23, 42, .35);
   --scrollbar-thumb: #c3cbd7;
-  --topbar-bg: rgba(255, 255, 255, .82);
+  --topbar-bg: #ffffff;
   --glow-accent: rgba(13, 148, 136, .5);
   --glow-success: rgba(5, 150, 105, .45);
   --glow-danger: rgba(220, 38, 38, .45);
@@ -133,7 +133,7 @@
   --node-glow: rgba(45, 212, 191, .10);
   --overlay: rgba(4, 8, 16, .58);
   --scrollbar-thumb: #2a3347;
-  --topbar-bg: rgba(10, 13, 19, .72);
+  --topbar-bg: #10141d;
   --glow-accent: rgba(45, 212, 191, .8);
   --glow-success: rgba(52, 211, 153, .7);
   --glow-danger: rgba(248, 113, 113, .7);
@@ -150,7 +150,7 @@
 /* ── 3. base ───────────────────────────────────────────────────────────── */
 * { box-sizing: border-box; }
 
-html { scroll-behavior: smooth; }
+/* smooth 滚动已撤：它让键盘流（j/k）每次跳卡都播放滚动动画，连按反而发黏 */
 
 body {
   margin: 0;
@@ -222,7 +222,7 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .topbar {
   position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 12px;
   flex-wrap: wrap; padding: 10px 24px; border-bottom: 1px solid var(--border-1);
-  background: var(--topbar-bg); backdrop-filter: blur(12px);
+  background: var(--topbar-bg); /* 毛玻璃已撤：backdrop-filter 是 sticky 顶栏在滚动/抽屉动效时最贵的绘制操作 */
 }
 .topbar h1 {
   font-family: var(--font-display);
@@ -374,7 +374,7 @@ table.tbl td:last-child { white-space: nowrap; }
 /* ── 12. overlays：modal / toast / spinner ─────────────────────────────── */
 .modal-overlay {
   position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
-  background: var(--overlay); backdrop-filter: blur(4px);
+  background: var(--overlay); /* blur 已撤：全屏模糊是开弹窗/抽屉瞬间最贵的绘制 */
 }
 .modal {
   width: min(440px, calc(100vw - 40px)); background: var(--bg-3);
@@ -465,7 +465,7 @@ table.tbl td:last-child { white-space: nowrap; }
 /* ── 14. 抽屉 Drawer：右侧滑出全高面板（所有视图的新容器）──────────────── */
 .drawer-overlay {
   position: fixed; inset: 0; z-index: 40; display: flex; justify-content: flex-end;
-  background: var(--overlay); backdrop-filter: blur(2px);
+  background: var(--overlay); /* blur 已撤：与 modal 同理 */
   animation: fade-in .18s ease-out;
 }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }

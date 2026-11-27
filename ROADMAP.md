@@ -227,6 +227,20 @@
 - **怎么算完成**：按评审报告第六节"轻微 16 项"清单逐项勾销，全部有测试或验证记录。
 - **来源**：W/轻微 16 项 + R8 + L8（清单见 EXPERT-REVIEW-2026-11-26.md 第六节）
 
+### C9 同源记忆合并撞唯一键（decisions-log #119 发现的真 bug）
+- **状态**：⬜
+- **产品视角**：两条记忆出自同一句话（共享 source_msg）时，"合并并改写文案"会撞数据库唯一键而失败。当前靠"不改写文案"绕过，合并增量信息的场景暂时受限。
+- **开发实现**：两案择一或并用——① 0010 迁移把 UNIQUE (source_msg, content_hash) 改成 partial index（WHERE status='active'），需先论证 write 重放幂等（被软删的行重放会复活，write 路径要补 deleted 预检）；② _merge_pair 检测"要改写内容且两行同 source_msg"时放弃改写，走 NOOP 合并在备注里注明。
+- **怎么算完成**：content 覆盖合并同源记忆对的集成测试通过；生产重放 3 个历史撞键对（#1353/#1362/#1372）能带改写合并成功。
+- **来源**：#119 AI 代判时实发 UniqueViolation（memories_source_msg_content_hash_key，0001_initial_schema.py:139 + review.py:244-255）
+
+### C10 指标页与 GIL 停顿（UI 卡顿治理 #120 的遗留后端项）
+- **状态**：⬜
+- **产品视角**：记忆数量涨大后指标页会变慢（现在每次都把全部判定记录拉进程序里算比例）；另外 Claude 会话活跃时界面偶发半秒停顿（召回的向量编码和网站后端挤在同一个进程里）。
+- **开发实现**：① /v1/metrics 的 _override_rate 改 SQL 聚合（GROUP BY kind + overridden + 高置信 FILTER，不再全表进 Python）；② bge-m3 encode 移出 uvicorn 进程（模型 sidecar 或独立编码服务），后端走 HTTP 调用。
+- **怎么算完成**：route_decisions 涨到 5 万行时 /v1/metrics 仍 <100ms；召回编码期间后端其他接口无 GIL 停顿。
+- **来源**：#120 测量记录（metrics.py:140-163 全表分桶；encode ~100ms GIL 占用同进程）
+
 ---
 
 ## D. 明确不做（重新提案前先看评审报告与 decisions-log）

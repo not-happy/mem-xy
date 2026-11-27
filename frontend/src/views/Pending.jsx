@@ -46,7 +46,7 @@ export default function Pending({ partition, onDecided }) {
         e.preventDefault()
         setSelIdx((i) => {
           const next = e.key === 'j' ? Math.min(i + 1, items.length - 1) : Math.max(i - 1, 0)
-          cardRefs.current[items[next]?.id]?.scrollIntoView?.({ block: 'nearest' })
+          cardRefs.current[items[next]?.id]?.scrollIntoView?.({ block: 'nearest', behavior: 'instant' })
           return next
         })
       } else if (e.key === '1' || e.key === '2' || e.key === '3') {

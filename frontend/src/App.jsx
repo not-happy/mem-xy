@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api.js'
 import OrgProjectPicker from './components/OrgProjectPicker.jsx'
 import Drawer from './components/Drawer.jsx'
@@ -123,13 +123,24 @@ function Shell() {
 
   // 分区变了要给子视图一个信号去重新拉数据。用 key 强制重挂，比传 useEffect 依赖简单。
   // project 由 OrgProjectPicker 内部防抖 300ms 后才上报，连敲不会每字符重挂载。
-  const partition = { org_key: org || undefined, project_key: project || undefined }
+  // partition 引用要稳（useMemo）：它是抽屉内容的记忆化依赖，引用每渲染都变就白记了。
+  const partition = useMemo(
+    () => ({ org_key: org || undefined, project_key: project || undefined }),
+    [org, project],
+  )
   const partitionKey = `${org}|${project}`
 
   const drawerKey = DRAWER_GROUPS[tab] ? tab : null
   const group = drawerKey ? DRAWER_GROUPS[drawerKey] : null
   const open = setTab
   const close = useCallback(() => setTab('cockpit'), [setTab])
+
+  // 抽屉内容按 (drawerKey, 分区) 记忆化：health 心跳、主题状态这类 App 层变化
+  // 不再把抽屉里的重列表（如 100 张待裁决卡）整棵拉着重渲一遍。
+  const drawerContent = useMemo(
+    () => (drawerKey ? renderView(drawerKey, partitionKey, partition) : null),
+    [drawerKey, partitionKey, partition],
+  )
 
   return (
     <div className="layout">
@@ -169,7 +180,7 @@ function Shell() {
           width={WIDE_DRAWER.has(drawerKey) ? 960 : 880}
           onClose={close}
         >
-          {renderView(drawerKey, partitionKey, partition, health)}
+          {drawerContent}
         </Drawer>
       )}
     </div>
@@ -220,6 +231,7 @@ function useHealth() {
 
   useEffect(() => {
     let alive = true
+    let timer = null
     const load = () => {
       api.health()
         .then((h) => {
@@ -228,18 +240,35 @@ function useHealth() {
           if (wasOkRef.current === true && !ok) toast.error(`后端状态劣化：${h?.status || '未知'}`)
           if (wasOkRef.current === false && ok) toast.success('后端已恢复')
           wasOkRef.current = ok
-          setHealth(h)
+          // 徽章只消费 status / loaded / load_seconds：三者没变就不触发整树重渲
+          // （health 里的 avg_ms_per_row 等字段每次召回都会变，不能拿它们比）。
+          setHealth((prev) => (
+            prev && prev.status === h?.status
+            && prev.embedding?.loaded === h?.embedding?.loaded
+            && prev.embedding?.load_seconds === h?.embedding?.load_seconds
+              ? prev : h
+          ))
         })
         .catch(() => {
           if (!alive) return
           if (wasOkRef.current === true) toast.error('后端不可达了（uvicorn 停了吗？）')
           wasOkRef.current = false
-          setHealth({ status: 'unreachable' })
+          setHealth((prev) => (prev?.status === 'unreachable' ? prev : { status: 'unreachable' }))
         })
     }
     load()
-    const t = setInterval(load, 30000)
-    return () => { alive = false; clearInterval(t) }
+    timer = setInterval(load, 30000)
+    // 标签页隐藏时停表，回前台立即补测并恢复心跳。
+    const onVis = () => {
+      if (document.hidden) { clearInterval(timer); timer = null }
+      else { load(); if (timer == null) timer = setInterval(load, 30000) }
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      alive = false
+      if (timer != null) clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [toast])
 
   return health
